@@ -1,15 +1,15 @@
 """
-Partition method registry — central registry for all partition pipeline methods.
+Method registry — central registry for pipeline methods.
 
-Each method is a combination of an initial-partition solver and a refinement
-solver.  Methods are registered with a unique name, a MethodName (family +
+Each method is a combination of a solver and a set of default parameters.
+Methods are registered with a unique name, a MethodName (family +
 algorithm), a human-readable description, and default parameter values.
 
 Usage:
-    from src.partition.method_registry import registry, MethodName, PartitionMethod
+    from src.method_registry import registry, MethodName, PartitionMethod
 
     # Look up a method
-    method = registry['init_fem_refine_metis']
+    method = registry['init_fem']
     result = method.run(J, q, **overrides)
 """
 
@@ -137,8 +137,8 @@ registry = _Registry()
 
 
 # ── Per-solver JSON config helpers ────────────────────────────────────────
-#   Each solver (fem, sbm, kaffpa, metis, cyclic) has a default JSON under
-#   src/partition/configs/{solver}.json.  At test time these are copied to
+#   Each solver (fem, sbm) has a default JSON under
+#   src/configs/{solver}.json.  At test time these are copied to
 #   the working config/ directory (gitignored) where users can override them.
 
 CONFIG_SRC = Path(__file__).resolve().parent / "configs"

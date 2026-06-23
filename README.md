@@ -1,81 +1,56 @@
 # fem-partition
 
-A Python library for solving graph and hypergraph partition problems using the **QUBO** framework, with multi-level pipelines and hardware-inspired solvers.
+A Python library for solving **QUBO** (Quadratic Unconstrained Binary Optimization) problems using physics-inspired and quantum-inspired solvers. Originally focused on graph/hypergraph partitioning, now extended to **TPU Full-Stack Optimization** problems including instruction scheduling, memory allocation, operator fusion, and test coverage selection.
 
 ## Problem Types
 
-| Type | Description |
-|------|-------------|
-| **Balanced minimum cut** (normal graph) | Partition graph vertices into `k` equal-weight blocks while minimizing the cut edges |
-| **Balanced minimum cut** (hypergraph) | Partition hypergraph vertices into `k` equal-weight blocks while minimizing the cut hyperedges (weighted-node-aware balance) |
-| **Max-cut** | Partition graph vertices into two blocks maximizing the cut edges |
-| **Max-SAT** | Approximate maximum satisfiability via QUBO encoding |
+| Category | Type | Description |
+|----------|------|-------------|
+| **Classic** | Balanced minimum cut | Partition graph/hypergraph vertices into `k` equal-weight blocks minimizing cut edges |
+| **Classic** | Max-cut | Partition vertices into two blocks maximizing cut edges |
+| **Classic** | Max-SAT | Approximate maximum satisfiability via QUBO encoding |
+| **TPU** | Instruction Scheduling | Assign operations to (processor, time) slots under dependency and capacity constraints |
+| **TPU** | Memory Allocation | Assign tensors to memory blocks with conflict avoidance and capacity limits |
+| **TPU** | Operator Fusion | Cluster operations into groups minimizing inter-cluster data traffic |
+| **TPU** | Test Coverage | Select tests to maximize functional coverage under cardinality constraints |
 
 ## Solvers
 
-### Normal Graph Solvers
+All solvers expose a standard `solve(Q, num_vars)` interface where `Q` is a sparse upper-triangular QUBO matrix as `List[Tuple[int, int, float]]`.
 
-| Solver | Source | Description |
+| Solver | Import | Description |
 |--------|--------|-------------|
-| **FEM** | `src/fem/` | Mean-field entropy minimization with simulated annealing |
-| **SBM** | `src/sbm/` | Simulated Bifurcation — physics-inspired Ising machine solver |
-| **KaFFPa / KaHIP** | `src/partition/kaffpa_multiway.py` | External Karlsruhe Fast Flow Partitioner (wrapper) |
-| **METIS** | `src/partition/refine.py` | External METIS multi-level partitioner (wrapper) |
-| **Cyclic Expansion** | `src/fem/cyclic_expansion.py` | Cyclic Expansion FEM refinement (arXiv 2312.15467v1) |
+| **FEM** | `from src.fem import FemSolver` | Mean-field entropy minimization with simulated annealing |
+| **SBM** | `from src.sbm import SbmSolver` | Simulated Bifurcation — physics-inspired Ising machine solver |
+| **QIS3** | `from src.qis3 import Qis3Solver` | Quantum-Inspired Solver v3 (SB + branch & bound + adaptive perturbation) |
 
-### Hypergraph Solvers
-
-All in `src/hyper_solver.py`:
-
-| Solver | Role | Description |
-|--------|------|-------------|
-| **KahyparLikeSolver** | Coarsening | HEM (heavy-edge matching) coarsening with optional LSH pre-coarsening; saves a `hierarchy_stack` for V-Cycle |
-| **FemCoarsenSolver** | Initial partition | FEM or PUBO-based initial partition on a coarsened hypergraph |
-| **HyperRefineSolver** | Refinement | FM (greedy incremental), MCTS rollouts, evolutionary search, or hybrid combinations |
-
-These three solvers compose into a complete hypergraph pipeline (see below).
-
-## Pipelines
-
-### Normal Graph Pipeline
-
-Multi-level partitioning combining coarsening, initial partitioning, and refinement via solver composition. Methods are registered in `src/method_registry.py` and dispatched by name:
-
-| Method | Family | Init Solver | Refine Solver |
-|--------|--------|-------------|---------------|
-| `direct_fem` | DI | FEM (on full graph) | — |
-| `direct_sbm` | DI | SBM (on full graph) | — |
-| `kaffpa` | DML | KaFFPa (native multi-level) | KaFFPa |
-| `init_fem_refine_kaffpa` | IECM | FEM (on coarse) | KaFFPa |
-| `init_sbm_refine_kaffpa` | IECM | SBM (on coarse) | KaFFPa |
-| `init_kaffpa_refine_fem` | MIER | KaFFPa (on coarse) | Cyclic Expansion FEM |
-| `coarse_fem_refine_kaffpa` | IECM | FEM (on coarse) | KaFFPa |
-| `coarse_kaffpa_refine_fem` | MIER | KaFFPa (on coarse) | Cyclic Expansion FEM |
-
-Pipeline families:
-| Family | Meaning | Flow |
-|--------|---------|------|
-| **DI** | Direct | Solver runs directly on the full graph (no coarsening) |
-| **DML** | Direct Multi-Level | Native tool manages its own coarsening + refinement |
-| **IECM** | Init + External Coarsen + Refine | Coarsen → FEM/SBM init → External refine |
-| **MIER** | Multi-level Init + Ext. Refine | External init on coarse → Cyclic Expansion FEM refine |
-
-### Hypergraph Pipeline
-
-| Stage | Method | Description |
-|-------|--------|-------------|
-| **Coarsening** | HEM / LSH | Heavy-edge matching directly on hyperedges; optional MinHash/LSH pre-coarsening for large graphs. Intermediate levels are saved in a `hierarchy_stack`. |
-| **Initial partition** | Greedy / FEM / PUBO | Initial assignment on the coarsest level — either greedy (built into `KahyparLikeSolver`) or optimization-based (`FemCoarsenSolver`). |
-| **V-Cycle uncoarsening** | Iterative projection + refinement | Pop levels off the `hierarchy_stack` one-by-one. At each step: project the current assignment to the next finer level via the saved `remap` array, then refine immediately. |
-| **Refinement** | FM / MCTS / Evolution / Hybrid | Greedy incremental FM (flow), Monte-Carlo tree search rollouts, small evolutionary search, or any combination in a configurable `mode_cycle`. |
+### Standard Solver Interface
 
 ```python
-# Usage:
-res = kahypar_solver.coarsen(hyperedges, num_nodes, q)       # coarsen
-fem_part = fem_solver.initial_partition(...)                   # init
-final = vcycle_uncoarsen(fem_part, res['hierarchy_stack'],     # V-Cycle
-                         hyperedges, q, refine_solver)
+from src.fem import FemSolver
+
+solver = FemSolver(num_trials=10, num_steps=1000)
+solution = solver.solve(Q, num_vars)  # returns List[int] of 0/1
 ```
+
+## TPU Optimization Module
+
+Located in `src/tpu/`:
+
+| File | Description |
+|------|-------------|
+| `generators.py` | QUBO builders: `build_scheduling_qubo`, `build_coloring_qubo`, `build_partitioning_qubo`, `build_coverage_qubo` |
+| `baselines.py` | Classical heuristics: `list_scheduling`, `greedy_coloring`, `kl_partitioning`, `greedy_coverage` |
+| `benchmark.py` | Orchestrator: generates instances, solves with all 3 solvers + baselines, outputs CSV |
+
+### Problem Formulations
+
+| Problem | Variables | Constraints | Objective |
+|---------|-----------|-------------|-----------|
+| **Scheduling** | `num_ops × num_processors × time_horizon` | Unique assignment, dependencies, resource capacity | Minimize makespan |
+| **Coloring** | `num_tensors × K + K` (aux y_c) | Unique color, conflict edges, link x ≤ y, capacity | Minimize colors used |
+| **Partitioning** | `num_ops × G` | Unique group, load balancing | Minimize cut weight |
+| **Coverage** | `num_tests + num_points` | Implication (x → y), no false positives, exact-K | Maximize coverage |
 
 ## Acceleration
 
@@ -90,31 +65,38 @@ compile_sbm = True    # compile SBM bsb_torch_batch step function
 
 ```
 src/
-├── hyper_solver.py      # Hypergraph solver: KahyparLikeSolver,
-│                        #   FemCoarsenSolver, HyperRefineSolver, vcycle_uncoarsen
-├── solver_base.py       # Solver base classes (Fem, Sbm, Kaffpa, Metis, Cyclic)
-├── method_registry.py   # Pipeline method registry + JSON config loading
-├── fem/                 # Flexible Entropy Minimization solver
-├── partition/           # Multi-level partitioning (coarsen, refine, hyper_utils)
+├── solver_base.py       # Solver base classes (FemSolver, SbmSolver)
+├── method_registry.py   # Method registry + JSON config loading
+├── fem/                 # Flexible Entropy Minimization solver + QUBO wrapper
+│   ├── __init__.py      #   FemSolver (standard solve interface)
+│   ├── interface.py     #   FEM class
+│   ├── problem.py       #   OptimizationProblem, expected_qubo, manual_grad_qubo
+│   ├── solver_fem.py    #   Solver (mean-field iteration)
+│   └── utils.py         #   Graph I/O utilities
 ├── sbm/                 # Simulated Bifurcation Machines
+│   ├── __init__.py      #   SbmSolver (standard solve interface)
+│   └── sbm.py           #   BSB/DSB solver
 ├── qis3/                # Quantum-Inspired Solver v3
+│   ├── __init__.py      #   Qis3Solver (standard solve interface)
+│   └── qis3.py          #   QIS3 (SB + branch & bound)
+├── tpu/                 # TPU Full-Stack Optimization (NEW)
+│   ├── __init__.py      #   Public API exports
+│   ├── generators.py    #   QUBO matrix builders for 4 problem types
+│   ├── baselines.py     #   Classical heuristic baselines
+│   └── benchmark.py     #   Benchmark orchestrator
 ├── digcim/              # Digital Co-Ising Machine experiments
-└── configs/             # Default solver JSON configs (fem, sbm, kaffpa, metis, cyclic)
-tests/                   # Test suite and benchmarks
-├── test_hyper_bmincut_coarsen.py  # Hypergraph V-Cycle benchmark
-├── test_hyper_bmincut.py         # Hypergraph bmincut tests
-├── test_bmincut_coarsen.py       # Multi-level coarsening benchmarks
-├── test_bmincut.py               # Graph bmincut tests
-├── test_bmincut_base.py          # Base test utilities
-├── test_bmincut_gpu_boost.py     # GPU acceleration tests
-├── plot_results.py               # Result plotting (5 plot types)
-├── utils.py                      # Hypergraph I/O utilities
-├── config/                       # Working config copies (gitignored)
-└── build/                        # Benchmark CSV outputs
+└── configs/             # Default solver JSON configs (fem, sbm)
+tests/                   # Test suite
+├── test_generators.py   # QUBO generator tests
+├── test_baselines.py    # Baseline heuristic tests
+├── test_benchmark.py    # Benchmark integration tests
+├── config/              # Working config copies (gitignored)
+└── build/               # Benchmark CSV outputs
 benchmarks/
-├── bmincut/                      # Balanced min-cut benchmarks
-├── maxcut/                       # Max-cut benchmarks (Gset, WK2000)
-└── maxsat/                       # Max-SAT benchmarks
+├── bmincut/             # Balanced min-cut benchmarks
+├── maxcut/              # Max-cut benchmarks (Gset, WK2000)
+├── maxsat/              # Max-SAT benchmarks
+└── tpu/                 # (NEW) TPU instance data
 doc/                    # Module documentation
 config/                 # Working solver configs (copied from src/configs/)
 build/                  # Benchmark result CSVs
@@ -129,11 +111,6 @@ conda activate fem
 
 # 2. Install PyTorch (see https://pytorch.org/)
 pip3 install torch torchvision torchaudio
-
-# 3. Optional: external partition tools
-pip install pymetis             # METIS wrapper
-pip install kahypar             # KaHyPar
-pip install kahip               # KaFFPa/KaHIP
 ```
 
 ## Configuration
@@ -143,10 +120,7 @@ Each solver has a default JSON config under `src/configs/`. At runtime these are
 ```
 config/
 ├── fem.json
-├── sbm.json
-├── kaffpa.json
-├── metis.json
-└── cyclic.json
+└── sbm.json
 ```
 
 Use `method_registry.ensure_configs()` to populate the working directory, or manually edit the JSON files in `config/`.
@@ -156,34 +130,28 @@ Use `method_registry.ensure_configs()` to populate the working directory, or man
 Run from project root:
 
 ```powershell
-python -u tests/test_hyper_bmincut_coarsen.py   # Hypergraph V-Cycle (best-of-N trials)
-python -u tests/test_hyper_bmincut.py           # Hypergraph bmincut tests
-python -u tests/test_bmincut_coarsen.py         # Multi-level coarsening benchmarks
-python -u tests/test_bmincut.py                 # Graph bmincut tests
-python -u tests/test_bmincut_gpu_boost.py       # GPU acceleration tests
-python -u tests/plot_results.py                 # Plot results (5 plot types)
+python -u tests/test_generators.py     # QUBO generator unit tests
+python -u tests/test_baselines.py      # Baseline heuristic tests
+python -u tests/test_benchmark.py      # Benchmark integration tests
 ```
 
-### Hypergraph V-Cycle Test
+### Running the TPU Benchmark
 
-`test_hyper_bmincut_coarsen.py` runs a configurable benchmark:
-- Coarsens once with HEM matching
-- Runs `num_runs` outer trials (different seeds) for greedy and FEM initial partitions
-- Each trial performs a full V-Cycle uncoarsening with refinement at every hierarchy level
-- Reports the best result in pipe-delimited table format:
-  ```
-  |powersim|4|88|0.047859578229574|140|0.046344235383255|15|
-  ```
+```powershell
+# Quick test (smallest sizes)
+python -m src.tpu.benchmark --quick
 
-### Select Methods
+# Full benchmark
+python -m src.tpu.benchmark --sizes 10,50,100 --trials 5
+```
 
-Set `partition_methods` in any test file to pick which pipeline to run (see [Normal Graph Pipeline](#normal-graph-pipeline) table above).
+Results are written to `build/tpu_benchmark_results.csv` with columns:
+`problem, size, trial, solver, runtime_seconds, solution_quality, metric_name`
 
 ## Documentation
 
 See `doc/` for detailed module documentation:
 - `doc/fem.md` — FEM solver details
-- `doc/partition.md` — Partition pipeline details
 - `doc/sbm.md` — Simulated Bifurcation details
 - `doc/qis3.md` — Quantum-Inspired Solver v3 details
 
@@ -191,7 +159,4 @@ See `doc/` for detailed module documentation:
 
 - FEM framework: mean-field entropy minimization with annealing
 - Simulated Bifurcation: Goto et al., Science Advances (2019)
-- Cyclic Expansion: arXiv 2312.15467v1
-- KaHyPar: Schlag et al., SEA (2016)
-- KaFFPa/KaHIP: Sanders & Schulz, ALENEX (2011)
-- KaHIP — Karlsruhe High Quality Partitioning (kahip.github.io)
+- QIS3: SB + Branch & Bound hybrid solver
