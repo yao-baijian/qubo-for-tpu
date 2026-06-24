@@ -219,11 +219,20 @@ def compute_comm_cost(edge_size: float, hops: int = 1) -> float:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def load_tpugraphs_npz(npz_path: str) -> Optional[Dict[str, Any]]:
+def load_tpugraphs_npz(
+    npz_path: str, max_nodes: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     """Load a single TpuGraphs ``.npz`` file and convert to metadata.
 
     Expected keys: ``node_opcode`` (n,), ``node_feat`` (n,140),
     ``edge_index`` (m,2).
+
+    Parameters
+    ----------
+    npz_path : str
+        Path to the ``.npz`` file.
+    max_nodes : int or None
+        If set, subsample to at most this many nodes (for quick testing).
 
     Returns metadata dict with ``problem_type`` and ``metadata`` compatible
     with :func:`build_scheduling_qubo`.
@@ -247,6 +256,24 @@ def load_tpugraphs_npz(npz_path: str) -> Optional[Dict[str, Any]]:
 
     if node_feat.shape[0] != num_nodes:
         return None
+
+    # Optional subsampling for large graphs
+    if max_nodes is not None and num_nodes > max_nodes:
+        rng = np.random.default_rng(42)
+        keep = rng.choice(num_nodes, size=max_nodes, replace=False)
+        keep_set = set(keep)
+        keep_idx = {int(old): new for new, old in enumerate(keep)}
+        node_opcode = node_opcode[keep]
+        node_feat = node_feat[keep]
+        # Filter edges to only include kept nodes
+        mask = np.isin(edge_index[:, 0], keep) & np.isin(edge_index[:, 1], keep)
+        edge_index = edge_index[mask]
+        # Remap indices
+        edge_index = np.array([
+            [keep_idx[int(u)], keep_idx[int(v)]]
+            for u, v in edge_index
+        ], dtype=np.int64)
+        num_nodes = max_nodes
 
     exec_time = np.array([
         estimate_exec_time(int(oc), node_feat[i])
@@ -304,10 +331,20 @@ def load_tpugraphs_npz(npz_path: str) -> Optional[Dict[str, Any]]:
 def load_tpugraphs_batch(
     data_dir: str,
     max_files: Optional[int] = None,
+    max_nodes: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Load multiple ``.npz`` files from a TpuGraphs directory tree.
 
     Layout: ``benchmarks/v0/npz/{collection}/{config}/{split}/{hash}.npz``
+
+    Parameters
+    ----------
+    data_dir : str
+        Root directory with ``.npz`` files.
+    max_files : int or None
+        Limit on number of files to load.
+    max_nodes : int or None
+        If set, subsample each graph to at most this many nodes.
     """
     results: List[Dict[str, Any]] = []
     p_dir = pathlib.Path(data_dir)
@@ -318,7 +355,7 @@ def load_tpugraphs_batch(
     for fpath in sorted(p_dir.rglob("*.npz")):
         if max_files is not None and len(results) >= max_files:
             break
-        parsed = load_tpugraphs_npz(str(fpath))
+        parsed = load_tpugraphs_npz(str(fpath), max_nodes=max_nodes)
         if parsed is not None:
             results.append(parsed)
 
