@@ -9,5 +9,6 @@
     "learning_rate": 0.1,
     "manual_grad": false,
     "h_factor": 0.01,
-    "use_compile": false
+    "use_compile": false,
+    "dev": "cpu"
 }

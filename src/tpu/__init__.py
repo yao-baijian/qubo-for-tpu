@@ -24,6 +24,9 @@ from .baselines import (
     kl_partitioning,
     greedy_coverage,
 )
+from .benchmark import run_benchmark, load_solver_config, instantiate_solver
+from .auto_tuner import AutoTuner
+from .gurobi_solver import GurobiSolver, is_gurobi_available
 
 __all__ = [
     "build_scheduling_qubo",
@@ -34,4 +37,10 @@ __all__ = [
     "greedy_coloring",
     "kl_partitioning",
     "greedy_coverage",
+    "run_benchmark",
+    "load_solver_config",
+    "instantiate_solver",
+    "AutoTuner",
+    "GurobiSolver",
+    "is_gurobi_available",
 ]

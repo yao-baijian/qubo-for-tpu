@@ -33,9 +33,93 @@ from src.tpu.baselines import (
     greedy_coverage,
 )
 from src.tpu.data_loader import load_problem_instances
-from src.fem import FemSolver
-from src.sbm import SbmSolver
-from src.qis3 import Qis3Solver
+
+import json
+
+# ── Config-driven solver instantiation ───────────────────────────────────
+
+
+def _config_dir() -> Path:
+    """Return the config directory (config/ or src/configs/ as fallback)."""
+    cfg = Path.cwd() / "config"
+    if cfg.is_dir():
+        return cfg
+    return Path(__file__).resolve().parents[2] / "src" / "configs"
+
+
+def load_solver_config(solver_name: str) -> dict:
+    """Load solver config from JSON file.
+
+    Reads ``config/{solver_name}.json`` or falls back to
+    ``src/configs/{solver_name}.json``.
+    """
+    for base in (Path.cwd() / "config",
+                  Path(__file__).resolve().parents[2] / "src" / "configs"):
+        path = base / f"{solver_name.lower()}.json"
+        if path.exists():
+            with open(path) as f:
+                cfg = json.load(f)
+            return {k: v for k, v in cfg.items() if k != "description"}
+    return {}
+
+
+def instantiate_solver(
+    solver_name: str,
+    config_overrides: Optional[dict] = None,
+) -> object:
+    """Create a solver instance from config file + optional overrides.
+
+    Parameters
+    ----------
+    solver_name : str
+        One of ``"FEM"``, ``"SBM"``, ``"QIS3"``.
+    config_overrides : dict or None
+        Keys to override in the loaded config.
+
+    Returns
+    -------
+    object
+        A solver instance with a ``.solve(Q, num_vars)`` method.
+    """
+    cfg = load_solver_config(solver_name)
+    if config_overrides:
+        cfg.update(config_overrides)
+
+    name = solver_name.upper()
+    if name == "FEM":
+        from src.fem import FemSolver
+        return FemSolver(
+            num_trials=cfg.get("num_trials", 5),
+            num_steps=cfg.get("num_steps", 500),
+            anneal=cfg.get("anneal", "lin"),
+            dev=cfg.get("dev", "cpu"),
+            betamin=cfg.get("betamin", 0.01),
+            betamax=cfg.get("betamax", 0.5),
+            learning_rate=cfg.get("learning_rate", 0.1),
+            manual_grad=cfg.get("manual_grad", False),
+            use_compile=cfg.get("use_compile", False),
+        )
+    elif name == "SBM":
+        from src.sbm import SbmSolver
+        return SbmSolver(
+            num_iters=cfg.get("num_iters", 500),
+            dt=cfg.get("dt", 0.1),
+            num_trials=cfg.get("num_trials", 5),
+            lambda_balance=cfg.get("lambda_balance", 1.0),
+            use_compile=cfg.get("use_compile", False),
+        )
+    elif name == "QIS3":
+        from src.qis3 import Qis3Solver
+        return Qis3Solver(
+            num_iters=cfg.get("num_iters", 500),
+            dt=cfg.get("dt", 0.1),
+            branch_depth=cfg.get("branch_depth", 1),
+            popsize=cfg.get("popsize", 5),
+            adaptive=cfg.get("adaptive", True),
+            device=cfg.get("device", "cpu"),
+        )
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,6 +370,10 @@ def run_benchmark(
     output_path: str = "build/tpu_benchmark_results.csv",
     num_trials: int = 1,
     verbose: bool = True,
+    use_gurobi: bool = False,
+    use_tuned: bool = False,
+    gurobi_time_limit: float = 30.0,
+    config_overrides: Optional[Dict[str, dict]] = None,
 ):
     """Run the full TPU benchmark suite.
 
@@ -308,12 +396,33 @@ def run_benchmark(
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Solver factory functions
-    solvers = {
-        "FEM": lambda: FemSolver(num_trials=5, num_steps=500, anneal="lin", dev="cpu"),
-        "SBM": lambda: SbmSolver(num_iters=500, dt=0.1, num_trials=5),
-        "QIS3": lambda: Qis3Solver(num_iters=500, dt=0.1, branch_depth=1, popsize=5),
-    }
+    # Solver names — instantiated per-instance via config
+    solver_names = ["FEM", "SBM", "QIS3"]
+
+    # Optional Gurobi
+    if use_gurobi:
+        try:
+            from src.tpu.gurobi_solver import GurobiSolver, is_gurobi_available
+            if is_gurobi_available():
+                solver_names.append("Gurobi")
+            elif verbose:
+                print("  [Gurobi not installed, skipping]")
+        except ImportError:
+            if verbose:
+                print("  [Gurobi not installed, skipping]")
+
+    # Pre-load tuned configs if requested
+    tuned_configs: Dict[str, dict] = {}
+    if use_tuned:
+        try:
+            from src.tpu.auto_tuner import AutoTuner
+            for problem_name in ("scheduling", "coloring", "partitioning", "coverage"):
+                for sn in ("FEM", "SBM", "QIS3"):
+                    tuned_configs[f"{sn}_{problem_name}"] = \
+                        AutoTuner.get_best_config(sn, problem_name)
+        except ImportError:
+            if verbose:
+                print("  [AutoTuner module not available, using defaults]")
 
     # Baseline mapping
     baselines = {
@@ -334,21 +443,26 @@ def run_benchmark(
     fieldnames = [
         "problem", "size", "trial", "solver",
         "runtime_seconds", "solution_quality", "metric_name",
+        "optimality_gap",
     ]
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
+        max_vars_gurobi = 5000  # only run Gurobi on small instances
+
         if data_source == "synthetic" and instance_sizes is not None:
             _run_synthetic_benchmark(
-                writer, instance_sizes, solvers, baselines, decoders,
-                num_trials, verbose,
+                writer, instance_sizes, solver_names, baselines, decoders,
+                num_trials, verbose, use_gurobi, tuned_configs,
+                gurobi_time_limit, max_vars_gurobi, config_overrides,
             )
         elif data_source != "synthetic":
             _run_data_source_benchmark(
-                writer, data_source, data_path, solvers, baselines, decoders,
-                verbose,
+                writer, data_source, data_path, solver_names, baselines,
+                decoders, verbose, use_gurobi, tuned_configs,
+                gurobi_time_limit, max_vars_gurobi, config_overrides,
             )
         else:
             raise ValueError(
@@ -359,8 +473,11 @@ def run_benchmark(
         print(f"\nResults written to: {output_path}")
 
 
-def _run_synthetic_benchmark(writer, instance_sizes, solvers, baselines,
-                              decoders, num_trials, verbose):
+def _run_synthetic_benchmark(writer, instance_sizes, solver_names, baselines,
+                              decoders, num_trials, verbose,
+                              use_gurobi, tuned_configs,
+                              gurobi_time_limit, max_vars_gurobi,
+                              config_overrides):
     """Run benchmark on synthetic instances (original code path)."""
     for problem_name, sizes in instance_sizes.items():
         if verbose:
@@ -408,12 +525,17 @@ def _run_synthetic_benchmark(writer, instance_sizes, solvers, baselines,
 
                 _run_solvers_and_baselines(
                     writer, problem_name, inst, size, trial,
-                    Q, num_vars, solvers, baselines, decoders, verbose,
+                    Q, num_vars, solver_names, baselines, decoders, verbose,
+                    use_gurobi, tuned_configs, gurobi_time_limit,
+                    max_vars_gurobi, config_overrides,
                 )
 
 
 def _run_data_source_benchmark(writer, data_source, data_path,
-                                 solvers, baselines, decoders, verbose):
+                                 solver_names, baselines, decoders, verbose,
+                                 use_gurobi, tuned_configs,
+                                 gurobi_time_limit, max_vars_gurobi,
+                                 config_overrides):
     """Run benchmark on instances loaded from a data source."""
     instances = load_problem_instances(
         source=data_source,
@@ -476,17 +598,54 @@ def _run_data_source_benchmark(writer, data_source, data_path,
 
         _run_solvers_and_baselines(
             writer, problem_name, meta, idx, 0,
-            Q, num_vars, solvers, baselines, decoders, verbose,
+            Q, num_vars, solver_names, baselines, decoders, verbose,
+            use_gurobi, tuned_configs, gurobi_time_limit,
+            max_vars_gurobi, config_overrides,
         )
 
 
 def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
-                                 Q, num_vars, solvers, baselines,
-                                 decoders, verbose):
+                                 Q, num_vars, solver_names, baselines,
+                                 decoders, verbose,
+                                 use_gurobi=False, tuned_configs=None,
+                                 gurobi_time_limit=30.0,
+                                 max_vars_gurobi=5000,
+                                 config_overrides=None):
     """Run all solvers and baselines on a single instance and write results."""
-    # ── Run solvers ────────────────────────────────────────────────────
-    for solver_name, solver_factory in solvers.items():
-        solver = solver_factory()
+    if tuned_configs is None:
+        tuned_configs = {}
+    if config_overrides is None:
+        config_overrides = {}
+
+    gurobi_obj: Optional[float] = None
+
+    # ── Run QUBO solvers ───────────────────────────────────────────────
+    for solver_name in solver_names:
+        if solver_name == "Gurobi":
+            if num_vars > max_vars_gurobi:
+                if verbose:
+                    print(f"    Gurobi: skipped ({num_vars} vars > {max_vars_gurobi} limit)")
+                continue
+            try:
+                from src.tpu.gurobi_solver import GurobiSolver
+                solver = GurobiSolver(time_limit=gurobi_time_limit, verbose=False)
+            except ImportError:
+                if verbose:
+                    print("    Gurobi: not installed, skipping")
+                continue
+        else:
+            # Config-driven instantiation
+            overrides = config_overrides.get(solver_name, {})
+            # Optional tuned config
+            tuned_key = f"{solver_name}_{problem_name}"
+            if tuned_configs and tuned_key in tuned_configs:
+                tuned_cfg = tuned_configs[tuned_key]
+                # Merge tuned over defaults (tuned values take priority)
+                for k, v in tuned_cfg.items():
+                    if k not in ("solver", "problem_type", "best_objective"):
+                        overrides.setdefault(k, v)
+            solver = instantiate_solver(solver_name, config_overrides=overrides)
+
         try:
             solution, runtime = _solve_with(
                 solver_name, solver.solve, Q, num_vars
@@ -494,6 +653,15 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             metrics = decoders[problem_name](solution, inst)
 
             quality, metric_name = _extract_metric(problem_name, metrics)
+
+            # Compute optimality gap if Gurobi ran
+            gap_str = ""
+            if solver_name != "Gurobi" and gurobi_obj is not None and gurobi_obj != 0:
+                gap = (quality - gurobi_obj) / abs(gurobi_obj)
+                gap_str = f"{gap:.4f}"
+            elif solver_name == "Gurobi":
+                gurobi_obj = quality
+                gap_str = "0.0000"
 
             writer.writerow({
                 "problem": problem_name,
@@ -503,11 +671,13 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
                 "runtime_seconds": f"{runtime:.6f}",
                 "solution_quality": f"{quality:.4f}",
                 "metric_name": metric_name,
+                "optimality_gap": gap_str,
             })
 
             if verbose:
+                extra = f"  gap={gap_str}" if gap_str else ""
                 print(f"    {solver_name}: {metric_name}={quality:.4f}, "
-                      f"time={runtime:.4f}s")
+                      f"time={runtime:.4f}s{extra}")
         except Exception as e:
             if verbose:
                 print(f"    {solver_name}: FAILED ({e})")
@@ -519,6 +689,7 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
                 "runtime_seconds": "ERROR",
                 "solution_quality": str(e),
                 "metric_name": "error",
+                "optimality_gap": "",
             })
 
     # ── Run baseline ───────────────────────────────────────────────────
@@ -549,6 +720,12 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
 
         quality, metric_name = _extract_metric(problem_name, metrics)
 
+        # Baseline gap vs Gurobi
+        gap_str = ""
+        if gurobi_obj is not None and gurobi_obj != 0:
+            gap = (quality - gurobi_obj) / abs(gurobi_obj)
+            gap_str = f"{gap:.4f}"
+
         writer.writerow({
             "problem": problem_name,
             "size": size,
@@ -557,11 +734,13 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             "runtime_seconds": f"{baseline_time:.6f}",
             "solution_quality": f"{quality:.4f}",
             "metric_name": metric_name,
+            "optimality_gap": gap_str,
         })
 
         if verbose:
+            extra = f"  gap={gap_str}" if gap_str else ""
             print(f"    {baseline_name}: {metric_name}={quality:.4f}, "
-                  f"time={baseline_time:.4f}s")
+                  f"time={baseline_time:.4f}s{extra}")
     except Exception as e:
         if verbose:
             print(f"    {baseline_name}: FAILED ({e})")
@@ -573,6 +752,7 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             "runtime_seconds": "ERROR",
             "solution_quality": str(e),
             "metric_name": "error",
+            "optimality_gap": "",
         })
 
 
@@ -614,7 +794,25 @@ if __name__ == "__main__":
                         help="Data source for problem instances")
     parser.add_argument("--data-path", type=str, default=None,
                         help="Path to data directory (required for tpugraphs/hlo_dump)")
+    parser.add_argument("--gurobi", action="store_true",
+                        help="Run Gurobi exact solver on small instances")
+    parser.add_argument("--gurobi-time-limit", type=float, default=30.0,
+                        help="Time limit for Gurobi solver (seconds)")
+    parser.add_argument("--tune", action="store_true",
+                        help="Run auto-tuning before benchmark")
+    parser.add_argument("--tune-trials", type=int, default=5,
+                        help="Number of tuning trials per solver (used with --tune)")
     args = parser.parse_args()
+
+    # Optional auto-tuning
+    if args.tune:
+        try:
+            from src.tpu.auto_tuner import AutoTuner
+            tuner = AutoTuner()
+            tuner.run_full_tuning(n_trials_per_config=args.tune_trials)
+            print("Auto-tuning complete. Using tuned configs for benchmark.")
+        except Exception as e:
+            print(f"Auto-tuning failed: {e}")
 
     if args.data_source == "synthetic":
         if args.quick:
@@ -634,6 +832,9 @@ if __name__ == "__main__":
             output_path=args.output,
             num_trials=args.trials,
             verbose=True,
+            use_gurobi=args.gurobi,
+            use_tuned=args.tune,
+            gurobi_time_limit=args.gurobi_time_limit,
         )
     else:
         run_benchmark(
@@ -642,4 +843,7 @@ if __name__ == "__main__":
             data_path=args.data_path,
             output_path=args.output,
             verbose=True,
+            use_gurobi=args.gurobi,
+            use_tuned=args.tune,
+            gurobi_time_limit=args.gurobi_time_limit,
         )
