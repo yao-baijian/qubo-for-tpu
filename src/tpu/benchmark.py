@@ -32,6 +32,7 @@ from src.tpu.baselines import (
     kl_partitioning,
     greedy_coverage,
 )
+from src.tpu.data_loader import load_problem_instances
 from src.fem import FemSolver
 from src.sbm import SbmSolver
 from src.qis3 import Qis3Solver
@@ -279,7 +280,9 @@ def _solve_with(name: str, solver: Callable, Q, num_vars):
 
 
 def run_benchmark(
-    instance_sizes: Dict[str, List[int]],
+    instance_sizes: Optional[Dict[str, List[int]]] = None,
+    data_source: str = "synthetic",
+    data_path: Optional[str] = None,
     output_path: str = "build/tpu_benchmark_results.csv",
     num_trials: int = 1,
     verbose: bool = True,
@@ -288,9 +291,14 @@ def run_benchmark(
 
     Parameters
     ----------
-    instance_sizes : dict
+    instance_sizes : dict or None
         Mapping from problem name to list of sizes, e.g.:
-        {"scheduling": [10, 50, 100], "coloring": [10, 50, 100], ...}
+        {"scheduling": [10, 50, 100], ...}
+        Only used when ``data_source="synthetic"``.
+    data_source : str
+        One of ``"synthetic"``, ``"tpugraphs"``, ``"hlo_dump"``, ``"mlperf"``.
+    data_path : str or None
+        Path to data (required for ``tpugraphs`` and ``hlo_dump``).
     output_path : str
         CSV output path.
     num_trials : int
@@ -332,166 +340,254 @@ def run_benchmark(
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for problem_name, sizes in instance_sizes.items():
-            if verbose:
-                print(f"\n{'='*60}")
-                print(f"  Benchmarking: {problem_name}")
-                print(f"{'='*60}")
-
-            for size in sizes:
-                for trial in range(num_trials):
-                    if verbose:
-                        print(f"  Size={size}, Trial={trial+1}/{num_trials}")
-
-                    # ── Generate instance ──────────────────────────────────
-                    random.seed(trial * 1000 + size)
-                    np.random.seed(trial * 1000 + size)
-
-                    if problem_name == "scheduling":
-                        inst = _make_scheduling_instance(size)
-                        Q, num_vars = build_scheduling_qubo(**inst)
-                    elif problem_name == "coloring":
-                        inst = _make_coloring_instance(size)
-                        Q, num_vars = build_coloring_qubo(
-                            inst["num_tensors"], inst["max_colors"],
-                            inst["conflict_edges"], inst["tensor_size"],
-                            capacity=inst["capacity"],
-                        )
-                    elif problem_name == "partitioning":
-                        inst = _make_partitioning_instance(size)
-                        Q, num_vars = build_partitioning_qubo(
-                            inst["num_ops"], inst["max_groups"],
-                            inst["edge_weights"], inst["op_cost"],
-                        )
-                    elif problem_name == "coverage":
-                        inst = _make_coverage_instance(size)
-                        Q, num_vars = build_coverage_qubo(
-                            inst["num_tests"], inst["num_points"],
-                            inst["coverage_matrix"], inst["max_select"],
-                            inst["point_weights"],
-                        )
-                    else:
-                        raise ValueError(f"Unknown problem: {problem_name}")
-
-                    if verbose:
-                        print(f"    Variables: {num_vars}, Q entries: {len(Q)}")
-
-                    # ── Run solvers ────────────────────────────────────────
-                    for solver_name, solver_factory in solvers.items():
-                        solver = solver_factory()
-                        try:
-                            solution, runtime = _solve_with(
-                                solver_name, solver.solve, Q, num_vars
-                            )
-                            metrics = decoders[problem_name](solution, inst)
-
-                            # Determine primary metric
-                            if problem_name == "scheduling":
-                                quality = metrics["makespan"]
-                                metric_name = "makespan"
-                            elif problem_name == "coloring":
-                                quality = metrics["colors_used"]
-                                metric_name = "colors_used"
-                            elif problem_name == "partitioning":
-                                quality = metrics["cut_weight"]
-                                metric_name = "cut_weight"
-                            elif problem_name == "coverage":
-                                quality = metrics["coverage_pct"]
-                                metric_name = "coverage_pct"
-
-                            writer.writerow({
-                                "problem": problem_name,
-                                "size": size,
-                                "trial": trial,
-                                "solver": solver_name,
-                                "runtime_seconds": f"{runtime:.6f}",
-                                "solution_quality": f"{quality:.4f}",
-                                "metric_name": metric_name,
-                            })
-
-                            if verbose:
-                                print(f"    {solver_name}: {metric_name}={quality:.4f}, "
-                                      f"time={runtime:.4f}s")
-                        except Exception as e:
-                            if verbose:
-                                print(f"    {solver_name}: FAILED ({e})")
-                            writer.writerow({
-                                "problem": problem_name,
-                                "size": size,
-                                "trial": trial,
-                                "solver": solver_name,
-                                "runtime_seconds": "ERROR",
-                                "solution_quality": str(e),
-                                "metric_name": "error",
-                            })
-
-                    # ── Run baseline ───────────────────────────────────────
-                    baseline_name, baseline_fn = baselines[problem_name]
-                    try:
-                        t0 = time.perf_counter()
-                        if problem_name == "scheduling":
-                            baseline_sol = baseline_fn(**inst)
-                        elif problem_name == "coloring":
-                            baseline_sol = baseline_fn(
-                                inst["num_tensors"], inst["max_colors"],
-                                inst["conflict_edges"], inst["tensor_size"],
-                                inst["capacity"],
-                            )
-                        elif problem_name == "partitioning":
-                            baseline_sol = baseline_fn(
-                                inst["num_ops"], inst["max_groups"],
-                                inst["edge_weights"], inst["op_cost"],
-                            )
-                        elif problem_name == "coverage":
-                            baseline_sol = baseline_fn(
-                                inst["num_tests"], inst["num_points"],
-                                inst["coverage_matrix"], inst["max_select"],
-                                inst["point_weights"],
-                            )
-                        baseline_time = time.perf_counter() - t0
-                        metrics = decoders[problem_name](baseline_sol, inst)
-
-                        if problem_name == "scheduling":
-                            quality = metrics["makespan"]
-                            metric_name = "makespan"
-                        elif problem_name == "coloring":
-                            quality = metrics["colors_used"]
-                            metric_name = "colors_used"
-                        elif problem_name == "partitioning":
-                            quality = metrics["cut_weight"]
-                            metric_name = "cut_weight"
-                        elif problem_name == "coverage":
-                            quality = metrics["coverage_pct"]
-                            metric_name = "coverage_pct"
-
-                        writer.writerow({
-                            "problem": problem_name,
-                            "size": size,
-                            "trial": trial,
-                            "solver": baseline_name,
-                            "runtime_seconds": f"{baseline_time:.6f}",
-                            "solution_quality": f"{quality:.4f}",
-                            "metric_name": metric_name,
-                        })
-
-                        if verbose:
-                            print(f"    {baseline_name}: {metric_name}={quality:.4f}, "
-                                  f"time={baseline_time:.4f}s")
-                    except Exception as e:
-                        if verbose:
-                            print(f"    {baseline_name}: FAILED ({e})")
-                        writer.writerow({
-                            "problem": problem_name,
-                            "size": size,
-                            "trial": trial,
-                            "solver": baseline_name,
-                            "runtime_seconds": "ERROR",
-                            "solution_quality": str(e),
-                            "metric_name": "error",
-                        })
+        if data_source == "synthetic" and instance_sizes is not None:
+            _run_synthetic_benchmark(
+                writer, instance_sizes, solvers, baselines, decoders,
+                num_trials, verbose,
+            )
+        elif data_source != "synthetic":
+            _run_data_source_benchmark(
+                writer, data_source, data_path, solvers, baselines, decoders,
+                verbose,
+            )
+        else:
+            raise ValueError(
+                "instance_sizes required when data_source='synthetic'"
+            )
 
     if verbose:
         print(f"\nResults written to: {output_path}")
+
+
+def _run_synthetic_benchmark(writer, instance_sizes, solvers, baselines,
+                              decoders, num_trials, verbose):
+    """Run benchmark on synthetic instances (original code path)."""
+    for problem_name, sizes in instance_sizes.items():
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  Benchmarking: {problem_name}")
+            print(f"{'='*60}")
+
+        for size in sizes:
+            for trial in range(num_trials):
+                if verbose:
+                    print(f"  Size={size}, Trial={trial+1}/{num_trials}")
+
+                # ── Generate instance ──────────────────────────────────
+                random.seed(trial * 1000 + size)
+                np.random.seed(trial * 1000 + size)
+
+                if problem_name == "scheduling":
+                    inst = _make_scheduling_instance(size)
+                    Q, num_vars = build_scheduling_qubo(**inst)
+                elif problem_name == "coloring":
+                    inst = _make_coloring_instance(size)
+                    Q, num_vars = build_coloring_qubo(
+                        inst["num_tensors"], inst["max_colors"],
+                        inst["conflict_edges"], inst["tensor_size"],
+                        capacity=inst["capacity"],
+                    )
+                elif problem_name == "partitioning":
+                    inst = _make_partitioning_instance(size)
+                    Q, num_vars = build_partitioning_qubo(
+                        inst["num_ops"], inst["max_groups"],
+                        inst["edge_weights"], inst["op_cost"],
+                    )
+                elif problem_name == "coverage":
+                    inst = _make_coverage_instance(size)
+                    Q, num_vars = build_coverage_qubo(
+                        inst["num_tests"], inst["num_points"],
+                        inst["coverage_matrix"], inst["max_select"],
+                        inst["point_weights"],
+                    )
+                else:
+                    raise ValueError(f"Unknown problem: {problem_name}")
+
+                if verbose:
+                    print(f"    Variables: {num_vars}, Q entries: {len(Q)}")
+
+                _run_solvers_and_baselines(
+                    writer, problem_name, inst, size, trial,
+                    Q, num_vars, solvers, baselines, decoders, verbose,
+                )
+
+
+def _run_data_source_benchmark(writer, data_source, data_path,
+                                 solvers, baselines, decoders, verbose):
+    """Run benchmark on instances loaded from a data source."""
+    instances = load_problem_instances(
+        source=data_source,
+        source_path=data_path,
+        max_instances=100,
+    )
+
+    generator_map = {
+        "scheduling": build_scheduling_qubo,
+        "coloring": build_coloring_qubo,
+        "partitioning": build_partitioning_qubo,
+        "coverage": build_coverage_qubo,
+    }
+
+    for idx, entry in enumerate(instances):
+        problem_name = entry["problem_type"]
+        meta = entry["metadata"]
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  Instance {idx+1}/{len(instances)}: {problem_name}")
+            print(f"{'='*60}")
+
+        # Build QUBO from metadata
+        gen_fn = generator_map.get(problem_name)
+        if gen_fn is None:
+            if verbose:
+                print(f"  Skipping unsupported problem type: {problem_name}")
+            continue
+
+        try:
+            if problem_name == "scheduling":
+                Q, num_vars = gen_fn(**meta)
+            elif problem_name == "coloring":
+                Q, num_vars = gen_fn(
+                    meta["num_tensors"], meta["max_colors"],
+                    meta["conflict_edges"], meta.get("tensor_size"),
+                    capacity=meta.get("capacity"),
+                )
+            elif problem_name == "partitioning":
+                Q, num_vars = gen_fn(
+                    meta["num_ops"], meta["max_groups"],
+                    meta["edge_weights"], meta["op_cost"],
+                )
+            elif problem_name == "coverage":
+                Q, num_vars = gen_fn(
+                    meta["num_tests"], meta["num_points"],
+                    meta["coverage_matrix"], meta["max_select"],
+                    meta.get("point_weights"),
+                )
+            else:
+                continue
+        except Exception as e:
+            if verbose:
+                print(f"  Skipping instance {idx}: QUBO build failed ({e})")
+            continue
+
+        if verbose:
+            print(f"    Variables: {num_vars}, Q entries: {len(Q)}")
+
+        _run_solvers_and_baselines(
+            writer, problem_name, meta, idx, 0,
+            Q, num_vars, solvers, baselines, decoders, verbose,
+        )
+
+
+def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
+                                 Q, num_vars, solvers, baselines,
+                                 decoders, verbose):
+    """Run all solvers and baselines on a single instance and write results."""
+    # ── Run solvers ────────────────────────────────────────────────────
+    for solver_name, solver_factory in solvers.items():
+        solver = solver_factory()
+        try:
+            solution, runtime = _solve_with(
+                solver_name, solver.solve, Q, num_vars
+            )
+            metrics = decoders[problem_name](solution, inst)
+
+            quality, metric_name = _extract_metric(problem_name, metrics)
+
+            writer.writerow({
+                "problem": problem_name,
+                "size": size,
+                "trial": trial,
+                "solver": solver_name,
+                "runtime_seconds": f"{runtime:.6f}",
+                "solution_quality": f"{quality:.4f}",
+                "metric_name": metric_name,
+            })
+
+            if verbose:
+                print(f"    {solver_name}: {metric_name}={quality:.4f}, "
+                      f"time={runtime:.4f}s")
+        except Exception as e:
+            if verbose:
+                print(f"    {solver_name}: FAILED ({e})")
+            writer.writerow({
+                "problem": problem_name,
+                "size": size,
+                "trial": trial,
+                "solver": solver_name,
+                "runtime_seconds": "ERROR",
+                "solution_quality": str(e),
+                "metric_name": "error",
+            })
+
+    # ── Run baseline ───────────────────────────────────────────────────
+    baseline_name, baseline_fn = baselines[problem_name]
+    try:
+        t0 = time.perf_counter()
+        if problem_name == "scheduling":
+            baseline_sol = baseline_fn(**inst)
+        elif problem_name == "coloring":
+            baseline_sol = baseline_fn(
+                inst["num_tensors"], inst["max_colors"],
+                inst["conflict_edges"], inst["tensor_size"],
+                inst["capacity"],
+            )
+        elif problem_name == "partitioning":
+            baseline_sol = baseline_fn(
+                inst["num_ops"], inst["max_groups"],
+                inst["edge_weights"], inst["op_cost"],
+            )
+        elif problem_name == "coverage":
+            baseline_sol = baseline_fn(
+                inst["num_tests"], inst["num_points"],
+                inst["coverage_matrix"], inst["max_select"],
+                inst["point_weights"],
+            )
+        baseline_time = time.perf_counter() - t0
+        metrics = decoders[problem_name](baseline_sol, inst)
+
+        quality, metric_name = _extract_metric(problem_name, metrics)
+
+        writer.writerow({
+            "problem": problem_name,
+            "size": size,
+            "trial": trial,
+            "solver": baseline_name,
+            "runtime_seconds": f"{baseline_time:.6f}",
+            "solution_quality": f"{quality:.4f}",
+            "metric_name": metric_name,
+        })
+
+        if verbose:
+            print(f"    {baseline_name}: {metric_name}={quality:.4f}, "
+                  f"time={baseline_time:.4f}s")
+    except Exception as e:
+        if verbose:
+            print(f"    {baseline_name}: FAILED ({e})")
+        writer.writerow({
+            "problem": problem_name,
+            "size": size,
+            "trial": trial,
+            "solver": baseline_name,
+            "runtime_seconds": "ERROR",
+            "solution_quality": str(e),
+            "metric_name": "error",
+        })
+
+
+def _extract_metric(problem_name: str, metrics: dict):
+    """Extract the primary metric name and value from a decoded metrics dict."""
+    if problem_name == "scheduling":
+        return metrics["makespan"], "makespan"
+    elif problem_name == "coloring":
+        return metrics["colors_used"], "colors_used"
+    elif problem_name == "partitioning":
+        return metrics["cut_weight"], "cut_weight"
+    elif problem_name == "coverage":
+        return metrics["coverage_pct"], "coverage_pct"
+    else:
+        return 0.0, "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -507,28 +603,43 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=1,
                         help="Number of random trials per size")
     parser.add_argument("--sizes", type=str, default="10,50",
-                        help="Comma-separated instance sizes")
+                        help="Comma-separated instance sizes (synthetic only)")
     parser.add_argument("--problems", type=str,
                         default="scheduling,coloring,partitioning,coverage",
-                        help="Comma-separated problem names")
+                        help="Comma-separated problem names (synthetic only)")
     parser.add_argument("--quick", action="store_true",
                         help="Run only the smallest sizes for a quick test")
+    parser.add_argument("--data-source", type=str, default="synthetic",
+                        choices=["synthetic", "tpugraphs", "hlo_dump", "mlperf"],
+                        help="Data source for problem instances")
+    parser.add_argument("--data-path", type=str, default=None,
+                        help="Path to data directory (required for tpugraphs/hlo_dump)")
     args = parser.parse_args()
 
-    if args.quick:
-        size_map = {
-            "scheduling": [10],
-            "coloring": [10],
-            "partitioning": [10],
-            "coverage": [10],
-        }
-    else:
-        sizes = [int(s) for s in args.sizes.split(",")]
-        size_map = {p: sizes for p in args.problems.split(",")}
+    if args.data_source == "synthetic":
+        if args.quick:
+            size_map = {
+                "scheduling": [10],
+                "coloring": [10],
+                "partitioning": [10],
+                "coverage": [10],
+            }
+        else:
+            sizes = [int(s) for s in args.sizes.split(",")]
+            size_map = {p: sizes for p in args.problems.split(",")}
 
-    run_benchmark(
-        instance_sizes=size_map,
-        output_path=args.output,
-        num_trials=args.trials,
-        verbose=True,
-    )
+        run_benchmark(
+            instance_sizes=size_map,
+            data_source="synthetic",
+            output_path=args.output,
+            num_trials=args.trials,
+            verbose=True,
+        )
+    else:
+        run_benchmark(
+            instance_sizes=None,
+            data_source=args.data_source,
+            data_path=args.data_path,
+            output_path=args.output,
+            verbose=True,
+        )

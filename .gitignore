@@ -168,3 +168,5 @@ vivado/*
 .Xil/
 
 result/*
+
+benchmarks/v0/*
