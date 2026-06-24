@@ -446,8 +446,6 @@ def main():
                         max_nodes_qubo=args.max_nodes_qubo,
                     )
                 elif stage in ("coloring", "partitioning", "coverage"):
-                    # Derive synthetic coloring/partitioning/coverage
-                    # from the real graph's metadata
                     derived = _derive_metadata(stage, metadata)
                     if derived:
                         run_stage(
@@ -455,6 +453,7 @@ def main():
                             solver_names, use_fem_mf=not args.no_fem_mf,
                             max_nodes_qubo=args.max_nodes_qubo,
                         )
+            f.flush()  # flush per-instance for crash safety
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}")
