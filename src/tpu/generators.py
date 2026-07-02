@@ -11,7 +11,8 @@ For an upper-triangular sparse matrix Q, represent it as a list of tuples
 (since x_i^2 = x_i).  value on off-diagonal (i < j) is the quadratic
 coefficient for x_i * x_j.
 """
-
+import math
+import warnings
 from typing import List, Tuple, Optional
 
 # Type alias for sparse QUBO entries
@@ -29,6 +30,86 @@ def _add_off_diag(Q: QuboMatrix, i: int, j: int, val: float):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Helper: Time-Window Pruning
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_time_windows(
+    num_ops: int,
+    exec_time: List[float],
+    comm_cost: List[List[float]],
+    makespan_upper_bound: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Compute earliest / latest start times for each operation.
+
+    Assumes nodes are numbered in topological order (as produced by
+    TpuGraphs ``edge_index``), so edges go from lower-index nodes to
+    higher-index nodes.
+
+    Parameters
+    ----------
+    num_ops : int
+        Number of operations.
+    exec_time : list of float
+        exec_time[v] = execution time of operation v.
+    comm_cost : list of list of float
+        comm_cost[u][v] = communication cost between u and v.
+        Non-zero values indicate a dependency edge u -> v.
+    makespan_upper_bound : int
+        Upper bound on the schedule makespan (in time steps).
+
+    Returns
+    -------
+    est : list of int
+        Earliest start time for each operation.
+    lst : list of int
+        Latest start time for each operation.
+    windows : list of int
+        Window size (lst[v] - est[v] + 1) for each operation.
+    """
+    # Convert float times to integer time steps (ceiling)
+    exec_int = [int(math.ceil(et)) for et in exec_time]
+    comm_int = [
+        [int(math.ceil(c)) if c > 0 else 0 for c in row]
+        for row in comm_cost
+    ]
+
+    est = [0] * num_ops
+    lst = [0] * num_ops
+
+    # ── Forward pass (topological order) ──────────────────────────────
+    # EST[v] = max(EST[u] + exec_time[u] + comm_cost[u][v]) over all
+    #          predecessors u with comm_cost[u][v] > 0
+    for v in range(num_ops):
+        max_est = 0
+        for u in range(v):
+            w = comm_int[u][v]
+            if w > 0:
+                candidate = est[u] + exec_int[u] + w
+                if candidate > max_est:
+                    max_est = candidate
+        est[v] = max_est
+
+    # ── Backward pass (reverse topological order) ─────────────────────
+    # LST[exit] = makespan_upper_bound - exec_time[exit]
+    # LST[u] = min(LST[v] - exec_time[u] - comm_cost[u][v]) over all
+    #          successors v with comm_cost[u][v] > 0
+    for v in range(num_ops - 1, -1, -1):
+        # Find the minimum among all successors
+        min_lst = makespan_upper_bound - exec_int[v]
+        for u in range(v + 1, num_ops):
+            w = comm_int[v][u]
+            if w > 0:
+                candidate = lst[u] - exec_int[v] - w
+                if candidate < min_lst:
+                    min_lst = candidate
+        lst[v] = min_lst
+
+    windows = [lst[v] - est[v] + 1 for v in range(num_ops)]
+
+    return est, lst, windows
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 1. Assignment (TPU Instruction Scheduling)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -43,13 +124,26 @@ def build_scheduling_qubo(
     lambda1: float = 10.0,
     lambda2: float = 10.0,
     lambda3: float = 10.0,
+    compute_windows: bool = False,
+    makespan_upper_bound: Optional[int] = None,
 ) -> Tuple[QuboMatrix, int]:
     """Build QUBO for TPU instruction scheduling (assignment problem).
 
-    Indexing
-    --------
+    When ``compute_windows=True``, time-window pruning reduces variables
+    by limiting each operation to its feasible time window
+    [EST[v], LST[v]] instead of the full [0, time_horizon).
+
+    Indexing (global time)
+    ----------------------
     idx(v, p, t) = (v * num_processors + p) * time_horizon + t
     Total vars n = num_ops * num_processors * time_horizon
+
+    Indexing (pruned windows)
+    -------------------------
+    Each node v has a window of ``window_sizes[v] = LST[v] - EST[v] + 1``
+    time slots.  Offsets are pre-computed so that:
+        idx(v, p, t) = offset[v] + p * window_sizes[v] + (t - EST[v])
+    Total vars n = sum_v num_processors * window_sizes[v]
 
     Parameters
     ----------
@@ -58,17 +152,24 @@ def build_scheduling_qubo(
     num_processors : int
         Number of available processors.
     time_horizon : int
-        Number of time steps.
+        Number of time steps (used directly when ``compute_windows=False``,
+        otherwise as default for ``makespan_upper_bound``).
     exec_time : list of float
         exec_time[v] = execution time of operation v.
     comm_cost : list of list of float
         comm_cost[u][v] = communication cost between op u and op v.
+        Non-zero values indicate a dependency edge u -> v.
     resource_demand : list of float
         resource_demand[v] = resource units required by op v.
     proc_capacity : list of list of float
         proc_capacity[p][t] = capacity of processor p at time t.
     lambda1, lambda2, lambda3 : float
         Penalty weights for constraints.
+    compute_windows : bool
+        If True, use time-window pruning to reduce variables.
+    makespan_upper_bound : int or None
+        Upper bound on makespan for LST computation.
+        If None and ``compute_windows=True``, defaults to ``time_horizon``.
 
     Returns
     -------
@@ -77,17 +178,54 @@ def build_scheduling_qubo(
     num_vars : int
         Number of binary variables.
     """
-    n = num_ops * num_processors * time_horizon
+    # ── Set up time windows or global horizon ──────────────────────────────
+    if compute_windows:
+        if makespan_upper_bound is None:
+            makespan_upper_bound = time_horizon
+
+        est, lst, window_sizes = compute_time_windows(
+            num_ops, exec_time, comm_cost, makespan_upper_bound,
+        )
+
+        # Warn if any window is empty (infeasible)
+        for v in range(num_ops):
+            if est[v] > lst[v]:
+                warnings.warn(
+                    f"Operation {v}: EST={est[v]} > LST={lst[v]}, "
+                    f"schedule infeasible under makespan bound {makespan_upper_bound}",
+                )
+
+        # Pre-compute offset array for dynamic index mapping
+        offsets = [0] * num_ops
+        for v in range(1, num_ops):
+            offsets[v] = offsets[v - 1] + num_processors * window_sizes[v - 1]
+
+        total_vars = offsets[-1] + num_processors * window_sizes[-1]
+
+        def idx(v: int, p: int, t: int) -> int:
+            return offsets[v] + p * window_sizes[v] + (t - est[v])
+
+        def time_range(v: int):
+            """Iterable of valid time slots for operation v."""
+            return range(est[v], lst[v] + 1)
+    else:
+        total_vars = num_ops * num_processors * time_horizon
+
+        def idx(v: int, p: int, t: int) -> int:
+            return (v * num_processors + p) * time_horizon + t
+
+        def time_range(v: int):
+            """Iterable of valid time slots for operation v (global)."""
+            return range(time_horizon)
+
+    n = total_vars
     Q: QuboMatrix = []
     _add = Q.append
-
-    def idx(v: int, p: int, t: int) -> int:
-        return (v * num_processors + p) * time_horizon + t
 
     # ── Step A: Unique Assignment (λ1) ────────────────────────────────────
     # penalty = λ1 * (sum_{p,t} x - 1)^2
     for v in range(num_ops):
-        vars_v = [(p, t) for p in range(num_processors) for t in range(time_horizon)]
+        vars_v = [(p, t) for p in range(num_processors) for t in time_range(v)]
         m = len(vars_v)
         for a in range(m):
             p1, t1 = vars_v[a]
@@ -112,29 +250,34 @@ def build_scheduling_qubo(
                 continue
             min_separation = exec_time[u] + w
             for p_u in range(num_processors):
-                for t_u in range(time_horizon):
+                for t_u in time_range(u):
                     i_u = idx(u, p_u, t_u)
                     for p_v in range(num_processors):
-                        for t_v in range(time_horizon):
+                        for t_v in time_range(v):
                             if t_v < t_u + min_separation:
                                 i_v = idx(v, p_v, t_v)
                                 _add_off_diag(Q, i_u, i_v, lambda2)
 
     # ── Step C: Resource Capacity (λ3) ────────────────────────────────────
     # For each (p, t), used = sum_v r_v * x_{v,p,t}
-    # Penalty = λ3 * max(0, used - cap)^2 = λ3 * (used - cap)^2 when used > cap
     # We use a soft penalty: λ3 * (sum_v r_v * x_{v,p,t} - cap)^2
     for p in range(num_processors):
         for t in range(time_horizon):
             cap = proc_capacity[p][t]
-            vars_pt = [v for v in range(num_ops)]
+            # Only consider ops whose window includes this time t
+            vars_pt = [v for v in range(num_ops)
+                       if not compute_windows or (est[v] <= t <= lst[v])]
             for a in range(len(vars_pt)):
                 v1 = vars_pt[a]
+                if compute_windows and not (est[v1] <= t <= lst[v1]):
+                    continue
                 i1 = idx(v1, p, t)
                 # Diagonal: -2*λ3*cap*r_v
                 _add((i1, i1, -2.0 * lambda3 * cap * resource_demand[v1]))
                 for b in range(a + 1, len(vars_pt)):
                     v2 = vars_pt[b]
+                    if compute_windows and not (est[v2] <= t <= lst[v2]):
+                        continue
                     i2 = idx(v2, p, t)
                     # Off-diagonal: +2*λ3*r_v1*r_v2
                     _add((i1, i2, 2.0 * lambda3 * resource_demand[v1] * resource_demand[v2]))
@@ -143,7 +286,7 @@ def build_scheduling_qubo(
     # Add t to diagonal to encourage early scheduling
     for v in range(num_ops):
         for p in range(num_processors):
-            for t in range(time_horizon):
+            for t in time_range(v):
                 i = idx(v, p, t)
                 _add((i, i, float(t)))
 

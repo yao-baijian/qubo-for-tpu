@@ -25,6 +25,7 @@ from src.tpu.data_loader import (
     load_problem_instances,
     generate_from_mlperf_model,
     get_mlperf_model_list,
+    compress_graph,
 )
 from src.tpu.generators import (
     build_scheduling_qubo,
@@ -381,8 +382,187 @@ def test_mlperf_unknown_model():
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# Run all
+# 6. Graph Compression Tests
 # ═════════════════════════════════════════════════════════════════════════
+
+
+def test_compress_graph_basic_chain():
+    """Compress a simple 4-node chain into 2-node chain."""
+    print("test_compress_graph_basic_chain:")
+
+    # Chain: 0 -> 1 -> 2 -> 3   (1 and 2 are degree-1)
+    metadata = {
+        "num_ops": 4,
+        "exec_time": [2.0, 1.0, 3.0, 2.0],
+        "comm_cost": [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0, 1.5],
+            [0.0, 0.0, 1.5, 0.0],
+        ],
+        "resource_demand": [1.0, 0.5, 1.5, 1.0],
+        "proc_capacity": [[5.0] * 10 for _ in range(4)],
+        "time_horizon": 10,
+        "num_processors": 4,
+    }
+
+    compressed = compress_graph(metadata)
+
+    # After compression: 0->1->2->3 becomes 0->3
+    # Node 1 folds into 0: exec_time[0] += 1.0 → 3.0
+    # Node 2 folds into 0 (since after removing 1, 0 now points to 2):
+    #   Actually, let's trace more carefully.
+    #   Iteration 1: degree-1 nodes = {1, 2}
+    #     Fold 1: 0 absorbs 1 (exec_time[0]=2+1=3), edge 0->2 = 1+2=3
+    #     Fold 2: 0 now has edge to 2. 2 has predecessor 0 and successor 3.
+    #       But wait - after folding 1, 2 might no longer be degree-1 if 0->2 was set.
+    #       Actually 2 has predecessor 0 (degree-1 for in) and successor 3 (degree-1 for out).
+    #       So 2 is still degree-1.
+    #       Fold 2: 0 absorbs 2 (exec_time[0]=3+3=6), edge 0->3 = 3+1.5=4.5
+    #   Result: 2 nodes [0, 3]
+    #   exec_time = [6.0, 2.0], comm_cost[0][3] = 4.5
+
+    expected_n = 2
+    assert compressed["num_ops"] == expected_n, \
+        f"Expected {expected_n} ops, got {compressed['num_ops']}"
+    assert compressed["exec_time"] == [6.0, 2.0], \
+        f"exec_time mismatch: {compressed['exec_time']}"
+    assert abs(compressed["comm_cost"][0][1] - 4.5) < 1e-9, \
+        f"comm_cost[0][1] expected 4.5, got {compressed['comm_cost'][0][1]}"
+    assert compressed["comm_cost"][1][0] == compressed["comm_cost"][0][1]
+
+    # resource_demand should take the max along the chain
+    assert compressed["resource_demand"] == [1.5, 1.0], \
+        f"resource_demand mismatch: {compressed['resource_demand']}"
+
+    print(f"  \u2713 Chain 4->2: exec_time={compressed['exec_time']}, "
+          f"comm_cost[0][1]={compressed['comm_cost'][0][1]:.1f}")
+    print()
+
+
+def test_compress_graph_no_change():
+    """Star graph: no node has exactly 1 predecessor and 1 successor."""
+    print("test_compress_graph_no_change:")
+
+    # Star: 0 -> 1, 0 -> 2, 0 -> 3  (0 has out-degree 3, leaves have in-degree 1)
+    metadata = {
+        "num_ops": 4,
+        "exec_time": [1.0, 2.0, 3.0, 4.0],
+        "comm_cost": [
+            [0.0, 1.0, 2.0, 3.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0],
+        ],
+        "resource_demand": [1.0] * 4,
+        "proc_capacity": [[5.0] * 10 for _ in range(4)],
+        "time_horizon": 10,
+        "num_processors": 4,
+    }
+
+    compressed = compress_graph(metadata)
+
+    # No degree-1 nodes (node 1 has in-degree 1 but out-degree 0)
+    assert compressed["num_ops"] == 4, \
+        f"Expected 4 ops (unchanged), got {compressed['num_ops']}"
+    assert compressed["exec_time"] == [1.0, 2.0, 3.0, 4.0]
+
+    print(f"  \u2713 Star graph unchanged: {compressed['num_ops']} ops")
+    print()
+
+
+def test_compress_graph_qubo_compatible():
+    """Compressed graph still produces a valid QUBO."""
+    print("test_compress_graph_qubo_compatible:")
+
+    # Chain: 0 -> 1 -> 2 -> 3
+    orig = {
+        "num_ops": 4,
+        "exec_time": [2.0, 1.0, 3.0, 2.0],
+        "comm_cost": [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0, 1.5],
+            [0.0, 0.0, 1.5, 0.0],
+        ],
+        "resource_demand": [1.0, 0.5, 1.5, 1.0],
+        "proc_capacity": [[5.0] * 10 for _ in range(2)],
+        "time_horizon": 10,
+        "num_processors": 2,
+    }
+
+    compressed = compress_graph(orig)
+
+    # Both should produce valid QUBOs
+    from src.tpu.generators import build_scheduling_qubo
+
+    Q_orig, n_orig = build_scheduling_qubo(**orig)
+    _check_qubo_structure(Q_orig, n_orig)
+
+    Q_comp, n_comp = build_scheduling_qubo(**compressed)
+    _check_qubo_structure(Q_comp, n_comp)
+
+    assert n_comp < n_orig, \
+        f"Compressed QUBO should have fewer vars: {n_comp} vs {n_orig}"
+
+    print(f"  \u2713 Original: {n_orig} vars, Compressed: {n_comp} vars "
+          f"({(1 - n_comp/n_orig)*100:.0f}% reduction)")
+    print()
+
+
+def test_compress_graph_backward_compat():
+    """load_problem_instances with compress=False behaves as before."""
+    print("test_compress_graph_backward_compat:")
+
+    instances = load_problem_instances(
+        source="synthetic", sizes=[6], max_instances=2, compress=False,
+    )
+    for inst in instances:
+        if inst["problem_type"] == "scheduling":
+            meta = inst["metadata"]
+            Q, n = build_scheduling_qubo(**meta)
+            _check_qubo_structure(Q, n)
+
+    print(f"  \u2713 {len(instances)} instances loaded without compression")
+    print()
+
+
+def test_compress_graph_tpugraphs_npz():
+    """load_tpugraphs_npz with compress=True reduces node count."""
+    print("test_compress_graph_tpugraphs_npz:")
+
+    npz_dir = ROOT / "benchmarks" / "v0" / "npz" / "layout" / "nlp" / "default" / "test"
+    if not npz_dir.is_dir():
+        print(f"  [skip] NPZ directory not found: {npz_dir}")
+        return
+
+    npz_files = sorted(npz_dir.glob("*.npz"))
+    if not npz_files:
+        print("  [skip] No NPZ files found")
+        return
+
+    fpath = str(npz_files[0])
+    result = load_tpugraphs_npz(fpath, max_nodes=20, compress=False)
+    result_comp = load_tpugraphs_npz(fpath, max_nodes=20, compress=True)
+
+    assert result is not None and result_comp is not None
+
+    orig_n = result["metadata"]["num_ops"]
+    comp_n = result_comp["metadata"]["num_ops"]
+
+    print(f"  Original: {orig_n} ops, Compressed: {comp_n} ops")
+    assert comp_n <= orig_n, \
+        f"Compressed should have <= ops ({comp_n} > {orig_n})"
+
+    # Both should produce valid QUBOs
+    Q_orig, n_orig = build_scheduling_qubo(**result["metadata"])
+    Q_comp, n_comp = build_scheduling_qubo(**result_comp["metadata"])
+    _check_qubo_structure(Q_orig, n_orig)
+    _check_qubo_structure(Q_comp, n_comp)
+
+    print(f"  \u2713 QUBO vars: {n_orig} -> {n_comp}")
+    print()
+
 
 if __name__ == "__main__":
     # Core pipeline
@@ -409,5 +589,12 @@ if __name__ == "__main__":
     test_mlperf_model_list()
     test_mlperf_generators()
     test_mlperf_unknown_model()
+
+    # Graph Compression
+    test_compress_graph_basic_chain()
+    test_compress_graph_no_change()
+    test_compress_graph_qubo_compatible()
+    test_compress_graph_backward_compat()
+    test_compress_graph_tpugraphs_npz()
 
     print("All data loader tests passed!")

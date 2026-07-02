@@ -17,6 +17,7 @@ from .generators import (
     build_coloring_qubo,
     build_partitioning_qubo,
     build_coverage_qubo,
+    compute_time_windows,
 )
 from .baselines import (
     list_scheduling,

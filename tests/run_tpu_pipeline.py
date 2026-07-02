@@ -40,7 +40,7 @@ from src.tpu.baselines import (
 from src.tpu.benchmark import (
     _decode_scheduling, _decode_coloring,
     _decode_partitioning, _decode_coverage,
-    _extract_metric,
+    _extract_metric, _format_violations, VIOLATION_FIELDS,
 )
 from src.fem import FemSolver
 from src.sbm import SbmSolver
@@ -337,12 +337,19 @@ def run_stage(
 
     results: List[dict] = []
 
+    # Collect violation field names for this problem type
+    violation_fields = VIOLATION_FIELDS.get(problem_type, [])
+
     # ── QUBO-path solvers ────────────────────────────────────────────
     for solver_name in solver_names:
         try:
             sol, runtime = _solve_qubo(solver_name, Q, num_vars, dev, problem_type)
             metrics = decoder(sol, metadata)
             quality, mname = _extract_metric(problem_type, metrics)
+            viol_str = _format_violations(problem_type, metrics)
+            print(f"    {solver_name} QUBO: {mname}={quality:.2f}, "
+                  f"runtime={runtime:.4f}s")
+            print(f"      violations: {viol_str}")
             results.append({
                 "solver": solver_name,
                 "path": "qubo",
@@ -350,6 +357,7 @@ def run_stage(
                 "metric": mname,
                 "runtime": runtime,
                 "constraint_ok": _check_constraints(problem_type, metrics),
+                "_metrics": metrics,
             })
         except Exception as e:
             print(f"    {solver_name} QUBO: FAILED ({e})")
@@ -367,6 +375,10 @@ def run_stage(
             )
             metrics_mf = decoder(sol_mf, metadata)
             quality_mf, mname_mf = _extract_metric(problem_type, metrics_mf)
+            viol_str = _format_violations(problem_type, metrics_mf)
+            print(f"    FEM-MF meanfield: {mname_mf}={quality_mf:.2f}, "
+                  f"runtime={runtime_mf:.4f}s")
+            print(f"      violations: {viol_str}")
             results.append({
                 "solver": "FEM-MF",
                 "path": "meanfield",
@@ -374,6 +386,7 @@ def run_stage(
                 "metric": mname_mf,
                 "runtime": runtime_mf,
                 "constraint_ok": _check_constraints(problem_type, metrics_mf),
+                "_metrics": metrics_mf,
             })
         except Exception as e:
             print(f"    FEM-MF meanfield: FAILED ({e})")
@@ -388,6 +401,10 @@ def run_stage(
         sol_bl, runtime_bl = _run_baseline(problem_type, metadata)
         metrics_bl = decoder(sol_bl, metadata)
         quality_bl, mname_bl = _extract_metric(problem_type, metrics_bl)
+        viol_str = _format_violations(problem_type, metrics_bl)
+        print(f"    Baseline: {mname_bl}={quality_bl:.2f}, "
+              f"runtime={runtime_bl:.4f}s")
+        print(f"      violations: {viol_str}")
         results.append({
             "solver": "Baseline",
             "path": "heuristic",
@@ -395,6 +412,7 @@ def run_stage(
             "metric": mname_bl,
             "runtime": runtime_bl,
             "constraint_ok": _check_constraints(problem_type, metrics_bl),
+            "_metrics": metrics_bl,
         })
     except Exception as e:
         print(f"    Baseline: FAILED ({e})")
@@ -406,7 +424,7 @@ def run_stage(
 
     # ── Write results ────────────────────────────────────────────────
     for r in results:
-        writer.writerow({
+        row = {
             "source": source_label,
             "problem": problem_type,
             "solver": r["solver"],
@@ -416,7 +434,12 @@ def run_stage(
             "runtime_s": f"{r['runtime']:.6f}",
             "constraints_ok": r["constraint_ok"],
             "num_vars": num_vars,
-        })
+        }
+        # Add per-constraint violation counts
+        metrics_r = r.get("_metrics", {})
+        for vf in violation_fields:
+            row[vf] = metrics_r.get(vf, "")
+        writer.writerow(row)
 
     # ── Print summary line ───────────────────────────────────────────
     best = min((r for r in results if r["quality"] >= 0),
@@ -532,10 +555,13 @@ def main():
         return
 
     # ── Write CSV header ──────────────────────────────────────────────
+    all_violation_fields = sorted(set(
+        f for fields in VIOLATION_FIELDS.values() for f in fields
+    ))
     fieldnames = [
         "source", "problem", "solver", "path",
         "quality", "metric", "runtime_s", "constraints_ok", "num_vars",
-    ]
+    ] + all_violation_fields
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

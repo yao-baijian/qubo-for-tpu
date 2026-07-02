@@ -221,6 +221,7 @@ def compute_comm_cost(edge_size: float, hops: int = 1) -> float:
 
 def load_tpugraphs_npz(
     npz_path: str, max_nodes: Optional[int] = None,
+    compress: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Load a single TpuGraphs ``.npz`` file and convert to metadata.
 
@@ -233,6 +234,8 @@ def load_tpugraphs_npz(
         Path to the ``.npz`` file.
     max_nodes : int or None
         If set, subsample to at most this many nodes (for quick testing).
+    compress : bool
+        If True, apply degree-1 chain reduction to shrink the graph.
 
     Returns metadata dict with ``problem_type`` and ``metadata`` compatible
     with :func:`build_scheduling_qubo`.
@@ -305,17 +308,24 @@ def load_tpugraphs_npz(
 
     proc_capacity = [[10.0] * time_horizon for _ in range(num_processors)]
 
+    metadata = {
+        "num_ops": num_nodes,
+        "num_processors": num_processors,
+        "time_horizon": time_horizon,
+        "exec_time": exec_time.tolist(),
+        "comm_cost": comm_cost,
+        "resource_demand": resource_demand,
+        "proc_capacity": proc_capacity,
+    }
+
+    if compress:
+        metadata = compress_graph(metadata)
+        # Update _num_nodes to reflect compressed size
+        num_nodes = metadata["num_ops"]
+
     return {
         "problem_type": "scheduling",
-        "metadata": {
-            "num_ops": num_nodes,
-            "num_processors": num_processors,
-            "time_horizon": time_horizon,
-            "exec_time": exec_time.tolist(),
-            "comm_cost": comm_cost,
-            "resource_demand": resource_demand,
-            "proc_capacity": proc_capacity,
-        },
+        "metadata": metadata,
         "_source": str(npz_path),
         "_num_nodes": num_nodes,
         "_num_edges": edge_index.shape[0],
@@ -332,6 +342,7 @@ def load_tpugraphs_batch(
     data_dir: str,
     max_files: Optional[int] = None,
     max_nodes: Optional[int] = None,
+    compress: bool = False,
 ) -> List[Dict[str, Any]]:
     """Load multiple ``.npz`` files from a TpuGraphs directory tree.
 
@@ -345,6 +356,8 @@ def load_tpugraphs_batch(
         Limit on number of files to load.
     max_nodes : int or None
         If set, subsample each graph to at most this many nodes.
+    compress : bool
+        If True, apply degree-1 chain reduction to each graph.
     """
     results: List[Dict[str, Any]] = []
     p_dir = pathlib.Path(data_dir)
@@ -355,7 +368,7 @@ def load_tpugraphs_batch(
     for fpath in sorted(p_dir.rglob("*.npz")):
         if max_files is not None and len(results) >= max_files:
             break
-        parsed = load_tpugraphs_npz(str(fpath), max_nodes=max_nodes)
+        parsed = load_tpugraphs_npz(str(fpath), max_nodes=max_nodes, compress=compress)
         if parsed is not None:
             results.append(parsed)
 
@@ -650,7 +663,155 @@ def generate_from_mlperf_model(model_name: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# D. Unified Loader Interface
+# D. Graph Compression (Chain Reduction)
+# ---------------------------------------------------------------------------
+
+
+def compress_graph(metadata: dict) -> dict:
+    """Compress a scheduling metadata dict by folding degree-1 nodes.
+
+    A *degree-1* node is a node with exactly 1 predecessor and 1 successor
+    in the directed DAG (edges ``u->v`` where ``comm_cost[u][v] > 0`` and
+    nodes are assumed to be in topological order).  Such a node is folded
+    into its predecessor:
+
+    * ``exec_time[predecessor] += exec_time[v]``
+    * ``comm_cost[predecessor][successor] = comm_cost[predecessor][v]
+      + comm_cost[v][successor]`` (set symmetrically)
+    * Node ``v`` is removed and all remaining nodes are re-indexed.
+
+    The process repeats until no degree-1 nodes remain (max 10 iterations).
+
+    Parameters
+    ----------
+    metadata : dict
+        Scheduling metadata dict with keys ``num_ops``, ``exec_time``,
+        ``comm_cost``, ``resource_demand``, ``proc_capacity``, etc.
+
+    Returns
+    -------
+    dict
+        New metadata dict with the same structure but potentially fewer
+        nodes.  ``time_horizon`` and ``proc_capacity`` are **not** updated
+        (the caller should adjust if needed).
+    """
+    import copy
+
+    meta = copy.deepcopy(metadata)
+    num_ops = meta["num_ops"]
+    exec_time = list(meta["exec_time"])
+    # Convert comm_cost to a mutable list-of-lists
+    comm_cost = [list(row) for row in meta["comm_cost"]]
+    resource_demand = list(meta["resource_demand"])
+
+    # Helper: compute in/out degree for each node (directed, topological)
+    def _compute_degrees(n):
+        in_deg = [0] * n
+        out_deg = [0] * n
+        for u in range(n):
+            for v in range(u + 1, n):
+                w = comm_cost[u][v]
+                if w > 0:
+                    out_deg[u] += 1
+                    in_deg[v] += 1
+        return in_deg, out_deg
+
+    for iteration in range(10):
+        in_deg, out_deg = _compute_degrees(num_ops)
+
+        # Find degree-1 nodes (exactly 1 predecessor and 1 successor)
+        degree1 = [
+            v for v in range(num_ops)
+            if in_deg[v] == 1 and out_deg[v] == 1
+        ]
+        if not degree1:
+            break
+
+        # Keep track of which nodes are still alive
+        alive = [True] * num_ops
+
+        for v in degree1:
+            if not alive[v]:
+                continue  # already folded by a previous iteration
+            # Find predecessor u (u < v with comm_cost[u][v] > 0)
+            u = None
+            for cand in range(v):
+                if alive[cand] and comm_cost[cand][v] > 0:
+                    u = cand
+                    break
+            # Find successor w (w > v with comm_cost[v][w] > 0)
+            w = None
+            for cand in range(v + 1, num_ops):
+                if alive[cand] and comm_cost[v][cand] > 0:
+                    w = cand
+                    break
+            if u is None or w is None:
+                continue
+
+            # Fold v into predecessor u
+            exec_time[u] += exec_time[v]
+
+            # Update edge weight: u -> w
+            new_weight = comm_cost[u][v] + comm_cost[v][w]
+            comm_cost[u][w] = new_weight
+            comm_cost[w][u] = new_weight
+
+            # Zero out edges to/from v
+            for x in range(num_ops):
+                comm_cost[x][v] = 0.0
+                comm_cost[v][x] = 0.0
+
+            # Merge resource demand (take the max as a conservative bound)
+            resource_demand[u] = max(resource_demand[u], resource_demand[v])
+            resource_demand[v] = 0.0
+
+            alive[v] = False
+
+        # ── Re-index: remove dead nodes ───────────────────────────────
+        old_to_new = {}
+        new_idx = 0
+        for old in range(num_ops):
+            if alive[old]:
+                old_to_new[old] = new_idx
+                new_idx += 1
+
+        new_n = new_idx
+        new_exec = [0.0] * new_n
+        new_comm = [[0.0] * new_n for _ in range(new_n)]
+        new_demand = [0.0] * new_n
+
+        for old, new in old_to_new.items():
+            new_exec[new] = exec_time[old]
+            new_demand[new] = resource_demand[old]
+            for old2, new2 in old_to_new.items():
+                if old < old2:
+                    w = comm_cost[old][old2]
+                    if w > 0:
+                        new_comm[new][new2] = w
+                        new_comm[new2][new] = w
+
+        exec_time = new_exec
+        comm_cost = new_comm
+        resource_demand = new_demand
+        num_ops = new_n
+    else:
+        # Loop completed without break (max iterations reached)
+        pass
+
+    # ── Update metadata ───────────────────────────────────────────────
+    meta["num_ops"] = num_ops
+    meta["exec_time"] = exec_time
+    meta["comm_cost"] = comm_cost
+    meta["resource_demand"] = resource_demand
+    # time_horizon is intentionally left unchanged; the caller can adjust
+    # proc_capacity is left unchanged (its time dimension still matches the
+    # original time_horizon)
+
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# E. Unified Loader Interface
 # ---------------------------------------------------------------------------
 
 
@@ -752,6 +913,7 @@ def load_problem_instances(
     problem_type: Optional[str] = None,
     max_instances: int = 100,
     sizes: Optional[List[int]] = None,
+    compress: bool = False,
 ) -> List[Dict[str, Any]]:
     """Load problem instances from a given source.
 
@@ -770,6 +932,9 @@ def load_problem_instances(
         Maximum number of instances to return.
     sizes : list of int or None
         Instance sizes to generate (only used when ``source="synthetic"``).
+    compress : bool
+        If True and the source is scheduling data, apply degree-1 chain
+        reduction to shrink the graph.
 
     Returns
     -------
@@ -790,7 +955,11 @@ def load_problem_instances(
             for pt in all_problems:
                 if len(instances) >= max_instances:
                     break
-                instances.append(_make_synthetic_instance(pt, size))
+                inst = _make_synthetic_instance(pt, size)
+                # Compress only scheduling instances
+                if compress and pt == "scheduling":
+                    inst["metadata"] = compress_graph(inst["metadata"])
+                instances.append(inst)
 
     elif source == "tpugraphs":
         if source_path is None:
@@ -801,7 +970,9 @@ def load_problem_instances(
         if not os.path.isdir(source_path):
             print(f"[data] TpuGraphs data dir not found: {source_path}")
             return instances
-        instances = load_tpugraphs_batch(source_path, max_files=max_instances)
+        instances = load_tpugraphs_batch(
+            source_path, max_files=max_instances, compress=compress,
+        )
 
     elif source == "hlo_dump":
         if source_path is None:
@@ -813,6 +984,9 @@ def load_problem_instances(
                 break
             if problem_type and parsed.get("problem_type") != problem_type:
                 continue
+            if compress and parsed.get("problem_type") == "scheduling":
+                parsed = dict(parsed)
+                parsed["metadata"] = compress_graph(parsed["metadata"])
             instances.append(parsed)
 
     elif source == "mlperf":
@@ -824,6 +998,9 @@ def load_problem_instances(
             if parsed is not None:
                 if problem_type and parsed.get("problem_type") != problem_type:
                     continue
+                if compress and parsed.get("problem_type") == "scheduling":
+                    parsed = dict(parsed)
+                    parsed["metadata"] = compress_graph(parsed["metadata"])
                 instances.append(parsed)
 
     else:

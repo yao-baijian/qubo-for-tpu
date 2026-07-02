@@ -229,44 +229,118 @@ def _decode_scheduling(solution: List[int], inst: dict) -> dict:
     n_ops = inst["num_ops"]
     n_proc = inst["num_processors"]
     T = inst["time_horizon"]
+    exec_time = inst["exec_time"]
+    comm_cost = inst["comm_cost"]
+    resource_demand = inst["resource_demand"]
+    proc_capacity = inst["proc_capacity"]
 
     def idx(v, p, t):
         return (v * n_proc + p) * T + t
 
     makespan = 0
     assigned = 0
+    # Parse assignment: (proc, time) per operation
+    assign_proc = {}
+    assign_time = {}
     for v in range(n_ops):
         for p in range(n_proc):
             for t in range(T):
                 if solution[idx(v, p, t)] == 1:
                     makespan = max(makespan, t + 1)
                     assigned += 1
-    # Feasibility checks
-    conflicts = 0
+                    assign_proc[v] = p
+                    assign_time[v] = t
+
+    # ── Constraint 1: Unique assignment ───────────────────────────────
+    unique_violations = 0
     for v in range(n_ops):
         count = sum(solution[idx(v, p, t)] for p in range(n_proc) for t in range(T))
         if count != 1:
-            conflicts += abs(count - 1)
+            unique_violations += abs(count - 1)
+
+    # ── Constraint 2: Dependencies ────────────────────────────────────
+    dependency_violations = 0
+    for u in range(n_ops):
+        if u not in assign_time:
+            continue
+        for v in range(n_ops):
+            if u == v or v not in assign_time:
+                continue
+            w = comm_cost[u][v]
+            if w == 0:
+                continue
+            min_sep = exec_time[u] + w
+            if assign_time[v] < assign_time[u] + min_sep:
+                dependency_violations += 1
+
+    # ── Constraint 3: Resource capacity ───────────────────────────────
+    capacity_violations = 0
+    for p in range(n_proc):
+        for t in range(T):
+            used = sum(
+                resource_demand[v]
+                for v in range(n_ops)
+                if assign_proc.get(v) == p and assign_time.get(v) == t
+            )
+            if used > proc_capacity[p][t]:
+                capacity_violations += 1
+
     return {
         "makespan": makespan,
-        "assigned_ops": assigned // int(max(1, max(inst["exec_time"]))),
-        "unique_violations": conflicts,
+        "assigned_ops": assigned // int(max(1, max(exec_time))),
+        "unique_violations": unique_violations,
+        "dependency_violations": dependency_violations,
+        "capacity_violations": capacity_violations,
     }
 
 
 def _decode_coloring(solution: List[int], inst: dict) -> dict:
     """Decode coloring QUBO solution into metrics."""
     K = inst["max_colors"]
-    n_base = inst["num_tensors"] * K
+    n_tensors = inst["num_tensors"]
+    n_base = n_tensors * K
     colors_used = sum(solution[n_base + c] for c in range(K))
+
+    # Parse assignment: color per tensor
+    color_of = {}
+    for v in range(n_tensors):
+        for c in range(K):
+            if solution[v * K + c] == 1:
+                color_of[v] = c
+                break
+
+    # ── Constraint 1: Unique color ────────────────────────────────────
+    unique_violations = 0
+    for v in range(n_tensors):
+        count = sum(solution[v * K + c] for c in range(K))
+        if count != 1:
+            unique_violations += abs(count - 1)
+
+    # ── Constraint 2: Conflict ────────────────────────────────────────
     conflict_violations = 0
     for u, v in inst["conflict_edges"]:
+        if u in color_of and v in color_of and color_of[u] == color_of[v]:
+            conflict_violations += 1
+
+    # ── Constraint 3: Capacity (if applicable) ────────────────────────
+    capacity_violations = 0
+    if "tensor_size" in inst and inst["tensor_size"] is not None \
+       and "capacity" in inst and inst["capacity"] is not None:
+        tensor_size = inst["tensor_size"]
+        cap = inst["capacity"]
         for c in range(K):
-            if solution[u * K + c] == 1 and solution[v * K + c] == 1:
-                conflict_violations += 1
+            total = sum(
+                tensor_size[v] for v in range(n_tensors)
+                if color_of.get(v) == c
+            )
+            if total > cap:
+                capacity_violations += 1
+
     return {
         "colors_used": int(colors_used),
+        "unique_violations": unique_violations,
         "conflict_violations": conflict_violations,
+        "capacity_violations": capacity_violations,
     }
 
 
@@ -274,9 +348,9 @@ def _decode_partitioning(solution: List[int], inst: dict) -> dict:
     """Decode partitioning QUBO solution into metrics."""
     G = inst["max_groups"]
     n_ops = inst["num_ops"]
+    op_cost = inst["op_cost"]
 
-    # Compute cut weight
-    cut = 0.0
+    # Parse assignment: group per operation
     group_of = {}
     for v in range(n_ops):
         for g in range(G):
@@ -284,6 +358,15 @@ def _decode_partitioning(solution: List[int], inst: dict) -> dict:
                 group_of[v] = g
                 break
 
+    # ── Constraint 1: Unique group ────────────────────────────────────
+    unique_violations = 0
+    for v in range(n_ops):
+        count = sum(solution[v * G + g] for g in range(G))
+        if count != 1:
+            unique_violations += abs(count - 1)
+
+    # Compute cut weight
+    cut = 0.0
     for u, v, w in inst["edge_weights"]:
         if u in group_of and v in group_of and group_of[u] != group_of[v]:
             cut += w
@@ -292,21 +375,22 @@ def _decode_partitioning(solution: List[int], inst: dict) -> dict:
     group_cost = [0.0] * G
     for v in range(n_ops):
         if v in group_of:
-            group_cost[group_of[v]] += inst["op_cost"][v]
-    avg_load = sum(inst["op_cost"]) / G
+            group_cost[group_of[v]] += op_cost[v]
+    avg_load = sum(op_cost) / G
     max_imbalance = max(abs(c - avg_load) for c in group_cost) / avg_load if avg_load > 0 else 0
 
-    # Unique group violations
-    violations = 0
-    for v in range(n_ops):
-        count = sum(solution[v * G + g] for g in range(G))
-        if count != 1:
-            violations += abs(count - 1)
+    # ── Constraint 2: Load balancing violation ────────────────────────
+    # Count groups whose load deviates more than 50% from average
+    imbalance_violations = sum(
+        1 for c in group_cost
+        if avg_load > 0 and abs(c - avg_load) / avg_load > 0.5
+    )
 
     return {
         "cut_weight": cut,
         "max_imbalance": max_imbalance,
-        "unique_violations": violations,
+        "unique_violations": unique_violations,
+        "imbalance_violations": imbalance_violations,
     }
 
 
@@ -314,6 +398,8 @@ def _decode_coverage(solution: List[int], inst: dict) -> dict:
     """Decode coverage QUBO solution into metrics."""
     n_tests = inst["num_tests"]
     n_pts = inst["num_points"]
+    coverage_matrix = inst["coverage_matrix"]
+    max_select = inst["max_select"]
 
     selected = [solution[t] for t in range(n_tests)]
     covered = [solution[n_tests + p] for p in range(n_pts)]
@@ -325,25 +411,61 @@ def _decode_coverage(solution: List[int], inst: dict) -> dict:
     for t in range(n_tests):
         if selected[t]:
             for p in range(n_pts):
-                if inst["coverage_matrix"][t][p]:
+                if coverage_matrix[t][p]:
                     actual_covered[p] = True
     coverage_pct = sum(actual_covered) / n_pts * 100 if n_pts > 0 else 0
 
-    # False positive: y_p=1 but no selected test covers it
+    # ── Constraint 1: Implication (x_t → y_p) ─────────────────────────
+    # If test t is selected, point p covered by t must have y_p = 1
+    implication_violations = 0
+    for t in range(n_tests):
+        if selected[t]:
+            for p in range(n_pts):
+                if coverage_matrix[t][p] and not covered[p]:
+                    implication_violations += 1
+
+    # ── Constraint 2: False positive (y_p → ∃ t covering p) ──────────
     false_positives = 0
     for p in range(n_pts):
         if covered[p]:
-            covered_by_any = any(inst["coverage_matrix"][t][p] and selected[t]
+            covered_by_any = any(coverage_matrix[t][p] and selected[t]
                                  for t in range(n_tests))
             if not covered_by_any:
                 false_positives += 1
+
+    # ── Constraint 3: Cardinality (sum x_t == K) ──────────────────────
+    cardinality_violations = abs(n_selected - max_select)
 
     return {
         "tests_selected": n_selected,
         "points_covered": n_covered,
         "coverage_pct": coverage_pct,
+        "implication_violations": implication_violations,
         "false_positives": false_positives,
+        "cardinality_violations": cardinality_violations,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Violation reporting helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+VIOLATION_FIELDS = {
+    "scheduling": ["unique_violations", "dependency_violations", "capacity_violations"],
+    "coloring": ["unique_violations", "conflict_violations", "capacity_violations"],
+    "partitioning": ["unique_violations", "imbalance_violations"],
+    "coverage": ["implication_violations", "false_positives", "cardinality_violations"],
+}
+
+
+def _format_violations(problem_name: str, metrics: dict) -> str:
+    """Format per-constraint violation counts as a human-readable string."""
+    parts = []
+    for field in VIOLATION_FIELDS.get(problem_name, []):
+        count = metrics.get(field, 0)
+        icon = "\u2713" if count == 0 else "\u2717"
+        parts.append(f"{icon} {field}={count}")
+    return " | ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -374,6 +496,7 @@ def run_benchmark(
     use_tuned: bool = False,
     gurobi_time_limit: float = 30.0,
     config_overrides: Optional[Dict[str, dict]] = None,
+    compress: bool = False,
 ):
     """Run the full TPU benchmark suite.
 
@@ -440,11 +563,16 @@ def run_benchmark(
         "coverage": _decode_coverage,
     }
 
+    # Collect all violation field names that appear across problem types
+    all_violation_fields = sorted(set(
+        f for fields in VIOLATION_FIELDS.values() for f in fields
+    ))
+
     fieldnames = [
         "problem", "size", "trial", "solver",
         "runtime_seconds", "solution_quality", "metric_name",
         "optimality_gap",
-    ]
+    ] + all_violation_fields
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -463,6 +591,7 @@ def run_benchmark(
                 writer, data_source, data_path, solver_names, baselines,
                 decoders, verbose, use_gurobi, tuned_configs,
                 gurobi_time_limit, max_vars_gurobi, config_overrides,
+                compress=compress,
             )
         else:
             raise ValueError(
@@ -535,12 +664,13 @@ def _run_data_source_benchmark(writer, data_source, data_path,
                                  solver_names, baselines, decoders, verbose,
                                  use_gurobi, tuned_configs,
                                  gurobi_time_limit, max_vars_gurobi,
-                                 config_overrides):
+                                 config_overrides, compress=False):
     """Run benchmark on instances loaded from a data source."""
     instances = load_problem_instances(
         source=data_source,
         source_path=data_path,
         max_instances=100,
+        compress=compress,
     )
 
     generator_map = {
@@ -617,6 +747,11 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
     if config_overrides is None:
         config_overrides = {}
 
+    # Collect all violation field names (module-level VIOLATION_FIELDS)
+    all_violation_fields = sorted(set(
+        f for fields in VIOLATION_FIELDS.values() for f in fields
+    ))
+
     gurobi_obj: Optional[float] = None
 
     # ── Run QUBO solvers ───────────────────────────────────────────────
@@ -663,7 +798,8 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
                 gurobi_obj = quality
                 gap_str = "0.0000"
 
-            writer.writerow({
+            # Build row with violation fields
+            row = {
                 "problem": problem_name,
                 "size": size,
                 "trial": trial,
@@ -672,16 +808,21 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
                 "solution_quality": f"{quality:.4f}",
                 "metric_name": metric_name,
                 "optimality_gap": gap_str,
-            })
+            }
+            for vf in all_violation_fields:
+                row[vf] = metrics.get(vf, "")
+            writer.writerow(row)
 
             if verbose:
                 extra = f"  gap={gap_str}" if gap_str else ""
+                viol_str = _format_violations(problem_name, metrics)
                 print(f"    {solver_name}: {metric_name}={quality:.4f}, "
                       f"time={runtime:.4f}s{extra}")
+                print(f"      violations: {viol_str}")
         except Exception as e:
             if verbose:
                 print(f"    {solver_name}: FAILED ({e})")
-            writer.writerow({
+            row = {
                 "problem": problem_name,
                 "size": size,
                 "trial": trial,
@@ -690,7 +831,10 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
                 "solution_quality": str(e),
                 "metric_name": "error",
                 "optimality_gap": "",
-            })
+            }
+            for vf in all_violation_fields:
+                row[vf] = ""
+            writer.writerow(row)
 
     # ── Run baseline ───────────────────────────────────────────────────
     baseline_name, baseline_fn = baselines[problem_name]
@@ -726,7 +870,7 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             gap = (quality - gurobi_obj) / abs(gurobi_obj)
             gap_str = f"{gap:.4f}"
 
-        writer.writerow({
+        row = {
             "problem": problem_name,
             "size": size,
             "trial": trial,
@@ -735,16 +879,21 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             "solution_quality": f"{quality:.4f}",
             "metric_name": metric_name,
             "optimality_gap": gap_str,
-        })
+        }
+        for vf in all_violation_fields:
+            row[vf] = metrics.get(vf, "")
+        writer.writerow(row)
 
         if verbose:
             extra = f"  gap={gap_str}" if gap_str else ""
+            viol_str = _format_violations(problem_name, metrics)
             print(f"    {baseline_name}: {metric_name}={quality:.4f}, "
                   f"time={baseline_time:.4f}s{extra}")
+            print(f"      violations: {viol_str}")
     except Exception as e:
         if verbose:
             print(f"    {baseline_name}: FAILED ({e})")
-        writer.writerow({
+        row = {
             "problem": problem_name,
             "size": size,
             "trial": trial,
@@ -753,7 +902,10 @@ def _run_solvers_and_baselines(writer, problem_name, inst, size, trial,
             "solution_quality": str(e),
             "metric_name": "error",
             "optimality_gap": "",
-        })
+        }
+        for vf in all_violation_fields:
+            row[vf] = ""
+        writer.writerow(row)
 
 
 def _extract_metric(problem_name: str, metrics: dict):
@@ -802,6 +954,8 @@ if __name__ == "__main__":
                         help="Run auto-tuning before benchmark")
     parser.add_argument("--tune-trials", type=int, default=5,
                         help="Number of tuning trials per solver (used with --tune)")
+    parser.add_argument("--compress", action="store_true",
+                        help="Apply degree-1 chain reduction to scheduling graphs")
     args = parser.parse_args()
 
     # Optional auto-tuning
@@ -835,6 +989,7 @@ if __name__ == "__main__":
             use_gurobi=args.gurobi,
             use_tuned=args.tune,
             gurobi_time_limit=args.gurobi_time_limit,
+            compress=args.compress,
         )
     else:
         run_benchmark(
@@ -846,4 +1001,5 @@ if __name__ == "__main__":
             use_gurobi=args.gurobi,
             use_tuned=args.tune,
             gurobi_time_limit=args.gurobi_time_limit,
+            compress=args.compress,
         )

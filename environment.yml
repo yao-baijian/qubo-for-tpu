@@ -12,8 +12,3 @@ dependencies:
 
 # ── PyTorch (install manually via pip, see https://pytorch.org/) ──────────
 # pip3 install torch torchvision torchaudio
-
-# ── Optional external partition tools (install via pip) ───────────────────
-# pip install pymetis             # METIS wrapper
-# pip install kahypar             # KaHyPar partitioner
-# pip install kahip               # KaFFPa / KaHIP partitioner
