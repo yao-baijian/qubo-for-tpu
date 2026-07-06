@@ -42,7 +42,9 @@ from src.tpu.benchmark import (
     _decode_partitioning, _decode_coverage,
     _extract_metric, _format_violations, VIOLATION_FIELDS,
 )
-from qubo_solver import FemSolver, SbmSolver, Qis3Solver
+from fem import FemSolver
+from sbm import SbmSolver
+from qis3 import Qis3Solver
 from src.tpu.fem_problem import (
     scheduling_to_fem_problem,
     coloring_to_fem_problem,
