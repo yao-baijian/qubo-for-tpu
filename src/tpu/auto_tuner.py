@@ -162,7 +162,7 @@ def _run_solver_with_params(
 ) -> float:
     """Run a solver with given params and return the QUBO objective value."""
     if solver_name == "FEM":
-        from src.fem import FemSolver
+        from qubo_solver import FemSolver
         solver = FemSolver(
             num_trials=params.get("num_trials", 5),
             num_steps=params.get("num_steps", 500),
@@ -174,7 +174,7 @@ def _run_solver_with_params(
             manual_grad=params.get("manual_grad", False),
         )
     elif solver_name == "SBM":
-        from src.sbm import SbmSolver
+        from qubo_solver import SbmSolver
         solver = SbmSolver(
             num_iters=params.get("num_iters", 500),
             dt=params.get("dt", 0.1),
@@ -182,7 +182,7 @@ def _run_solver_with_params(
             lambda_balance=params.get("lambda_balance", 1.0),
         )
     elif solver_name == "QIS3":
-        from src.qis3 import Qis3Solver
+        from qubo_solver import Qis3Solver
         solver = Qis3Solver(
             num_iters=params.get("num_iters", 500),
             dt=params.get("dt", 0.1),

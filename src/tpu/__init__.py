@@ -26,6 +26,7 @@ from .baselines import (
     greedy_coverage,
 )
 from .benchmark import run_benchmark, load_solver_config, instantiate_solver
+from .data_loader import compress_graph, load_problem_instances, load_tpugraphs_npz
 from .auto_tuner import AutoTuner
 from .gurobi_solver import GurobiSolver, is_gurobi_available
 

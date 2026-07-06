@@ -17,6 +17,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!lib/qubo-solver/
 lib64/
 parts/
 sdist/

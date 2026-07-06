@@ -9,6 +9,10 @@ dependencies:
     - pandas>=2.1
     - matplotlib>=3.7
     - pytest>=7.0
+    - pip
 
 # ── PyTorch (install manually via pip, see https://pytorch.org/) ──────────
 # pip3 install torch torchvision torchaudio
+#
+# ── QUBO solvers (external package) ──────────────────────────────────────
+# pip install -e ../qubo-solver

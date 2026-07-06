@@ -1,9 +1,0 @@
-{
-    "description": "QIS3 (Quantum-Inspired Solver v3) configuration",
-    "num_iters": 1000,
-    "dt": 0.1,
-    "branch_depth": 2,
-    "popsize": 10,
-    "adaptive": true,
-    "device": "cpu"
-}

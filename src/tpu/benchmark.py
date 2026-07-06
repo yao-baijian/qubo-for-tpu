@@ -87,7 +87,7 @@ def instantiate_solver(
 
     name = solver_name.upper()
     if name == "FEM":
-        from src.fem import FemSolver
+        from qubo_solver import FemSolver
         return FemSolver(
             num_trials=cfg.get("num_trials", 5),
             num_steps=cfg.get("num_steps", 500),
@@ -100,7 +100,7 @@ def instantiate_solver(
             use_compile=cfg.get("use_compile", False),
         )
     elif name == "SBM":
-        from src.sbm import SbmSolver
+        from qubo_solver import SbmSolver
         return SbmSolver(
             num_iters=cfg.get("num_iters", 500),
             dt=cfg.get("dt", 0.1),
@@ -109,7 +109,7 @@ def instantiate_solver(
             use_compile=cfg.get("use_compile", False),
         )
     elif name == "QIS3":
-        from src.qis3 import Qis3Solver
+        from qubo_solver import Qis3Solver
         return Qis3Solver(
             num_iters=cfg.get("num_iters", 500),
             dt=cfg.get("dt", 0.1),
