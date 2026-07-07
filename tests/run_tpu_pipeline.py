@@ -168,8 +168,6 @@ def _solve_qubo(
         solver = SbmSolver(**params)
     else:
         raise ValueError(f"Unknown solver: {solver_name}")
-    else:
-        raise ValueError(f"Unknown solver: {solver_name}")
 
     t0 = time.perf_counter()
     sol = solver.solve(Q, num_vars)
