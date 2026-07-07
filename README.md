@@ -8,6 +8,11 @@ This project provides a **unified QUBO framework** for four fundamental classes 
 
 | QUBO Class | TPU Problems | Lifecycle Stage |
 |------------|--------------|-----------------|
+Ising/QUBO solvers (FEM, SBM) are provided by the external
+**[qubo-solver](https://github.com/yao-baijian/qubo-solver)** submodule
+at ``lib/qubo-solver/``.  Import helpers in ``src/__init__.py``
+automatically add the submodule to ``sys.path``.
+
 | **Assignment** | Instruction scheduling, task-to-core mapping, DVFS level selection | Compile-time, Runtime |
 | **Coloring** | Tensor lifetime memory allocation, SRAM bank mapping | Compile-time, Design-time |
 | **Partitioning** | Operator fusion, NoC topology/routing partition | Compile-time, Design-time |
@@ -22,12 +27,14 @@ The framework enables:
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| FEM/SBM/QIS3 solvers | ✅ Complete | Three quantum-inspired QUBO solvers with standard interface |
 | QUBO generators (4 problem types) | ✅ Complete | Build sparse QUBO matrices for scheduling, coloring, partitioning, coverage |
 | Baseline heuristics (4 types) | ✅ Complete | List scheduling, greedy coloring, KL partitioning, greedy coverage |
 | Benchmark orchestrator | ✅ Complete | Unified benchmarking pipeline with CSV output |
 | Test suite | ✅ Complete | Unit tests for generators, baselines, benchmark |
-| **TpuGraphs data loader** | 🚧 In Progress | Load `.npz` files, extract HLO graphs, convert to QUBO input |
+| TpuGraphs data loader | ✅ Complete | Load `.npz` files, extract HLO graphs, convert to QUBO input |
+| Time-window pruning | ✅ Complete | EST/LST variable reduction for scheduling QUBO |
+| Graph compression | ✅ Complete | Degree-1 chain folding for DAG reduction |
+| Constraint violation reporting | ✅ Complete | Per-constraint violation breakdown in CSV output |
 | **Node exec_time estimator** | 🚧 In Progress | FLOPs-based execution time estimation from HLO features |
 | **Lifetime inference** | 🚧 In Progress | ASAP scheduling to infer tensor lifetimes from HLO DAG |
 | **Hardware config module** | 🚧 In Progress | TPU v3 parameter definitions and validation |
