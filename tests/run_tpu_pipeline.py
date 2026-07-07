@@ -44,7 +44,7 @@ from src.tpu.benchmark import (
 )
 from fem import FemSolver
 from sbm import SbmSolver
-from qis3 import Qis3Solver
+
 from src.tpu.fem_problem import (
     scheduling_to_fem_problem,
     coloring_to_fem_problem,
@@ -166,16 +166,8 @@ def _solve_qubo(
             "device": cfg.get("device", dev),
         }
         solver = SbmSolver(**params)
-    elif solver_name == "QIS3":
-        params = {
-            "num_iters": cfg.get("num_iters", 500),
-            "dt": cfg.get("dt", 0.1),
-            "branch_depth": cfg.get("branch_depth", 1),
-            "popsize": cfg.get("popsize", 5),
-            "adaptive": cfg.get("adaptive", True),
-            "device": cfg.get("device", dev),
-        }
-        solver = Qis3Solver(**params)
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}")
     else:
         raise ValueError(f"Unknown solver: {solver_name}")
 

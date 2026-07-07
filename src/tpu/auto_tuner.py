@@ -181,15 +181,6 @@ def _run_solver_with_params(
             num_trials=params.get("num_trials", 5),
             lambda_balance=params.get("lambda_balance", 1.0),
         )
-    elif solver_name == "QIS3":
-        from qis3 import Qis3Solver
-        solver = Qis3Solver(
-            num_iters=params.get("num_iters", 500),
-            dt=params.get("dt", 0.1),
-            branch_depth=params.get("branch_depth", 1),
-            popsize=params.get("popsize", 5),
-            adaptive=params.get("adaptive", True),
-        )
     else:
         raise ValueError(f"Unknown solver: {solver_name}")
 
@@ -273,7 +264,7 @@ class AutoTuner:
             One of ``"scheduling"``, ``"coloring"``, ``"partitioning"``,
             ``"coverage"``.
         solver_name : str
-            One of ``"FEM"``, ``"SBM"``, ``"QIS3"``.
+            One of ``"FEM"``, ``"SBM"``.
         n_trials : int
             Number of hyperparameter trials.
         size : int or None

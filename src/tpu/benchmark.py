@@ -108,16 +108,6 @@ def instantiate_solver(
             lambda_balance=cfg.get("lambda_balance", 1.0),
             use_compile=cfg.get("use_compile", False),
         )
-    elif name == "QIS3":
-        from qis3 import Qis3Solver
-        return Qis3Solver(
-            num_iters=cfg.get("num_iters", 500),
-            dt=cfg.get("dt", 0.1),
-            branch_depth=cfg.get("branch_depth", 1),
-            popsize=cfg.get("popsize", 5),
-            adaptive=cfg.get("adaptive", True),
-            device=cfg.get("device", "cpu"),
-        )
     else:
         raise ValueError(f"Unknown solver: {solver_name}")
 
@@ -520,7 +510,7 @@ def run_benchmark(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # Solver names — instantiated per-instance via config
-    solver_names = ["FEM", "SBM", "QIS3"]
+    solver_names = ["FEM", "SBM"]
 
     # Optional Gurobi
     if use_gurobi:

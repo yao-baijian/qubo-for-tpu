@@ -8,13 +8,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 QUBO_SOLVER_SRC = ROOT / "lib" / "qubo-solver" / "src"
 
-# Import solver.py directly via file path to avoid namespace clash with TPU's src/
+# Import sbm/sbm.py directly via file path to avoid namespace clash with TPU's src/
 _spec = importlib.util.spec_from_file_location(
-    "qubo_solver_solver",
-    QUBO_SOLVER_SRC / "solver.py",
+    "qubo_solver_sbm",
+    QUBO_SOLVER_SRC / "sbm" / "sbm.py",
 )
 _qss = importlib.util.module_from_spec(_spec)
-sys.modules["qubo_solver_solver"] = _qss
+sys.modules["qubo_solver_sbm"] = _qss
 _spec.loader.exec_module(_qss)
 
 Solver = _qss.Solver
